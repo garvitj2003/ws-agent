@@ -1,0 +1,10 @@
+services:
+  ws-agent:
+    build: .
+    container_name: ws-agent
+    restart: unless-stopped
+    ports:
+      - "${WS_PORT:-8765}:8765"
+    environment:
+      - WS_HOST=0.0.0.0
+      - WS_PORT=8765

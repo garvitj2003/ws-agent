@@ -30,7 +30,7 @@ The server accepts and broadcasts JSON objects matching either of the following 
 
 ---
 
-## Running the Server
+## Running Locally
 
 Using `uv`:
 
@@ -41,6 +41,38 @@ uv run python main.py
 Environment variables:
 - `WS_HOST` (default: `0.0.0.0`)
 - `WS_PORT` (default: `8765`)
+
+---
+
+## Running with Docker Compose
+
+Start the server:
+```bash
+docker compose up -d --build
+```
+
+View logs:
+```bash
+docker compose logs -f
+```
+
+Stop the server:
+```bash
+docker compose down
+```
+
+---
+
+## CI/CD Deployment (GitHub Actions)
+
+Continuous deployment is configured in `.github/workflows/deploy.yml` via SSH, matching the deployment workflow from `SBMG-backend-v2`.
+
+### Required GitHub Repository Secrets:
+- `SERVER_HOST`: Server IP address or hostname
+- `SERVER_USER`: SSH username (e.g., `ubuntu` or `root`)
+- `SERVER_SSH_KEY` or `SERVER_PASSWORD`: SSH private key or password
+- `SERVER_PORT`: SSH port (default: `22`)
+- `SERVER_PROJECT_PATH` *(optional)*: Full path to the repository on the server (e.g. `/home/ubuntu/ws-agent`)
 
 ---
 
