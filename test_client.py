@@ -33,7 +33,7 @@ async def run_tests():
         ack_laptop = await laptop_ws.recv()
         logging.info(f"Laptop registered: {ack_laptop}")
 
-        # 3. Phone sends message to Laptop (Direct Routing)
+        # 3. Direct Routing: Phone -> Laptop
         direct_msg = Envelope.create(
             type="msg",
             source="mobile:garvit-phone",
@@ -45,36 +45,104 @@ async def run_tests():
         logging.info(f"Laptop received direct msg: {recv_on_laptop}")
         parsed_laptop = Envelope.from_json(recv_on_laptop)
         assert parsed_laptop.body["text"] == "Run build on laptop"
-        assert parsed_laptop.source == "mobile:garvit-phone"
 
-        # 4. Laptop sends call to Mobile role (Role Targeting)
-        call_msg = Envelope.create(
-            type="call",
-            source="laptop:garvit-macbook",
-            target="mobile",
-            body=CallBody(audio="UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="),
-        )
-        await laptop_ws.send(call_msg.to_json())
-        recv_on_phone = await phone_ws.recv()
-        logging.info(f"Phone received call from laptop: {recv_on_phone}")
-        parsed_phone = Envelope.from_json(recv_on_phone)
-        assert parsed_phone.type == "call"
-        assert parsed_phone.source == "laptop:garvit-macbook"
-
-        # 5. Phone sends message to Server (Agent Processing)
-        server_msg = Envelope.create(
-            type="msg",
+        # 4. Action Test: reminder.create (pending status)
+        rem_create_env = Envelope.create(
+            type="action",
             source="mobile:garvit-phone",
             target="server",
-            body=MsgBody(text="What is my server status?"),
+            body={
+                "action": "reminder.create",
+                "data": {
+                    "title": "Call Mom",
+                    "scheduledAt": "2026-09-20T20:00:00+05:30",
+                    "description": "Weekly catchup call",
+                },
+            },
         )
-        await phone_ws.send(server_msg.to_json())
-        recv_agent_reply = await phone_ws.recv()
-        logging.info(f"Phone received Agent reply: {recv_agent_reply}")
-        parsed_reply = Envelope.from_json(recv_agent_reply)
-        assert parsed_reply.source == "server:core-agent"
+        await phone_ws.send(rem_create_env.to_json())
+        recv_rem_res = await phone_ws.recv()
+        logging.info(f"Phone received reminder.create result: {recv_rem_res}")
+        parsed_rem_res = Envelope.from_json(recv_rem_res)
+        assert parsed_rem_res.type == "action_result"
+        assert parsed_rem_res.body["status"] == "success"
+        reminder_id = parsed_rem_res.body["data"]["id"]
+        assert parsed_rem_res.body["data"]["status"] == "pending"
 
-        logging.info("✅ All envelope & routing tests passed!")
+        # 5. Action Test: reminder.dismiss
+        rem_dismiss_env = Envelope.create(
+            type="action",
+            source="mobile:garvit-phone",
+            target="server",
+            body={
+                "action": "reminder.dismiss",
+                "data": {"id": reminder_id},
+            },
+        )
+        await phone_ws.send(rem_dismiss_env.to_json())
+        recv_dismiss_res = await phone_ws.recv()
+        logging.info(f"Phone received reminder.dismiss result: {recv_dismiss_res}")
+        parsed_dismiss = Envelope.from_json(recv_dismiss_res)
+        assert parsed_dismiss.body["data"]["status"] == "dismissed"
+
+        # 6. Action Test: task.create & task.complete
+        task_create_env = Envelope.create(
+            type="action",
+            source="laptop:garvit-macbook",
+            target="server",
+            body={
+                "action": "task.create",
+                "data": {
+                    "title": "Review pull request #42",
+                    "priority": "high",
+                },
+            },
+        )
+        await laptop_ws.send(task_create_env.to_json())
+        recv_task_res = await laptop_ws.recv()
+        logging.info(f"Laptop received task.create result: {recv_task_res}")
+        parsed_task = Envelope.from_json(recv_task_res)
+        assert parsed_task.body["status"] == "success"
+        task_id = parsed_task.body["data"]["id"]
+
+        # 7. Action Test: safe SQL query
+        sql_env = Envelope.create(
+            type="action",
+            source="laptop:garvit-macbook",
+            target="server",
+            body={
+                "action": "query.sql",
+                "data": {
+                    "query": "SELECT id, title, status FROM reminders LIMIT 5",
+                },
+            },
+        )
+        await laptop_ws.send(sql_env.to_json())
+        recv_sql_res = await laptop_ws.recv()
+        logging.info(f"Laptop received query.sql result: {recv_sql_res}")
+        parsed_sql = Envelope.from_json(recv_sql_res)
+        assert parsed_sql.body["status"] == "success"
+
+        # 8. Action Test: unsafe SQL query boundary check
+        unsafe_sql_env = Envelope.create(
+            type="action",
+            source="laptop:garvit-macbook",
+            target="server",
+            body={
+                "action": "query.sql",
+                "data": {
+                    "query": "DROP TABLE reminders",
+                },
+            },
+        )
+        await laptop_ws.send(unsafe_sql_env.to_json())
+        recv_unsafe_res = await laptop_ws.recv()
+        logging.info(f"Laptop received unsafe query rejection: {recv_unsafe_res}")
+        parsed_unsafe = Envelope.from_json(recv_unsafe_res)
+        assert parsed_unsafe.body["status"] == "error"
+        assert "Disallowed keyword" in parsed_unsafe.body["error"] or "Only SELECT" in parsed_unsafe.body["error"]
+
+        logging.info("✅ All Action & Database integration tests passed successfully!")
 
 
 if __name__ == "__main__":

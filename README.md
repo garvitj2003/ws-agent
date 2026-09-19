@@ -1,52 +1,70 @@
-# WebSocket Server (`ws-agent`)
+# WebSocket Agent Hub (`ws-agent`)
 
-A lightweight asynchronous WebSocket server built with `uv` and `websockets` (Python 3.13+) that handles two message types: **`msg`** (text) and **`call`** (audio).
+A lightweight asynchronous WebSocket Agent Hub built with `uv`, `websockets` (Python 3.13+), `SQLAlchemy 2.0`, `PostgreSQL`, and `Alembic`.
 
-## Protocol Specification
+## Architecture & Capabilities
 
-The server accepts and broadcasts JSON objects matching either of the following schemas:
-
-### 1. `msg` (Text)
-```json
-{
-  "type": "msg",
-  "body": {
-    "text": "Hello, world!"
-  }
-}
-```
-
-### 2. `call` (Audio)
-```json
-{
-  "type": "call",
-  "body": {
-    "audio": "<base64_encoded_audio_or_audio_stream_data>"
-  }
-}
-```
-
-> **Note:** Payloads sent as top-level fields (e.g. `{"type": "msg", "text": "hello"}`) or under `"data"` are also automatically parsed and normalized.
+1. **Multi-Device Routing Mesh**: Point-to-point, role targeting (`mobile`, `laptop`), and broadcast (`*`).
+2. **Standard Protocol Envelope**: Strict contract with `id`, `type`, `timestamp`, `source`, `target`, and `body`.
+3. **Database & Action System**:
+   - Hybrid DB architecture: Strongly-typed action handlers (`reminder.*`, `task.*`, `event.*`) + sandboxed read-only SQL execution (`query.sql`).
+   - Reminders lifecycle: `pending` -> `triggered` -> `completed` / `dismissed` / `cancelled`.
+   - Dedicated PostgreSQL database mapped to port **`5435`** to prevent any port collisions on shared servers.
 
 ---
 
-## Running Locally
+## Protocol Envelope Contract
 
-Using `uv`:
-
-```bash
-uv run python main.py
+```json
+{
+  "id": "uuid-v4",
+  "type": "msg | call | register | action | action_result | ack | ping",
+  "timestamp": "2026-09-19T15:49:42.000Z",
+  "source": "mobile:garvit-phone",
+  "target": "server",
+  "body": {
+    "action": "reminder.create",
+    "data": {
+      "title": "Call Mom",
+      "scheduledAt": "2026-09-20T20:00:00+05:30"
+    }
+  }
+}
 ```
 
-Environment variables:
-- `WS_HOST` (default: `0.0.0.0`)
-- `WS_PORT` (default: `8765`)
+---
+
+## Action Domains
+
+### 1. Reminders (`reminder.*`)
+- `reminder.create`: Sets scheduled reminder (initial status: `pending`). Spawns async background trigger timer.
+- `reminder.get`: Get reminder by ID.
+- `reminder.list`: List reminders (filter by status `pending`, `dismissed`, etc.).
+- `reminder.dismiss`: Mark reminder as `dismissed`.
+- `reminder.complete`: Mark reminder as `completed`.
+- `reminder.delete`: Delete reminder.
+
+### 2. Tasks (`task.*`)
+- `task.create`: Create todo task with priority (`low`, `medium`, `high`, `urgent`).
+- `task.get`: Get task by ID.
+- `task.list`: List tasks (filter by `status`, `priority`).
+- `task.complete`: Mark task completed.
+- `task.delete`: Delete task.
+
+### 3. Events (`event.*`)
+- `event.create`: Create calendar event.
+- `event.list`: List upcoming events.
+- `event.delete`: Delete event.
+
+### 4. Sandboxed Read-Only SQL (`query.sql`)
+- `query.sql`: Executes safe read-only queries with AST validation and a 3-second statement timeout.
 
 ---
 
 ## Running with Docker Compose
 
-Start the server:
+Starts both PostgreSQL (port `5435`) and the WebSocket Agent Server (port `8765`):
+
 ```bash
 docker compose up -d --build
 ```
@@ -56,29 +74,11 @@ View logs:
 docker compose logs -f
 ```
 
-Stop the server:
-```bash
-docker compose down
-```
-
----
-
-## CI/CD Deployment (GitHub Actions)
-
-Continuous deployment is configured in `.github/workflows/deploy.yml` via SSH, matching the deployment workflow from `SBMG-backend-v2`.
-
-### Required GitHub Repository Secrets:
-- `SERVER_HOST`: Server IP address or hostname
-- `SERVER_USER`: SSH username (e.g., `ubuntu` or `root`)
-- `SERVER_SSH_KEY` or `SERVER_PASSWORD`: SSH private key or password
-- `SERVER_PORT`: SSH port (default: `22`)
-- `SERVER_PROJECT_PATH` *(optional)*: Full path to the repository on the server (e.g. `/home/ubuntu/ws-agent`)
-
 ---
 
 ## Testing
 
-Run the included test client script:
+Run the automated integration test suite:
 
 ```bash
 uv run python test_client.py

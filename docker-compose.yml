@@ -1,10 +1,50 @@
 services:
+  # ===========================================
+  # Dedicated PostgreSQL for ws-agent (Port 5435 to avoid conflicts)
+  # ===========================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: ws_agent_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ws_agent_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ws_agent_password}
+      POSTGRES_DB: ${POSTGRES_DB:-ws_agent_db}
+    volumes:
+      - ws_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5435}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ws_agent_user} -d ${POSTGRES_DB:-ws_agent_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ws_network
+
+  # ===========================================
+  # WebSocket Agent Server
+  # ===========================================
   ws-agent:
     build: .
-    container_name: ws-agent
+    container_name: ws_agent_app
     restart: unless-stopped
     ports:
       - "${WS_PORT:-8765}:8765"
     environment:
       - WS_HOST=0.0.0.0
       - WS_PORT=8765
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-ws_agent_user}:${POSTGRES_PASSWORD:-ws_agent_password}@postgres:5432/${POSTGRES_DB:-ws_agent_db}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - ws_network
+
+networks:
+  ws_network:
+    driver: bridge
+
+volumes:
+  ws_postgres_data:
+    driver: local

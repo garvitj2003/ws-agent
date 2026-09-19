@@ -8,6 +8,8 @@ from typing import Set
 
 from websockets.asyncio.server import ServerConnection, serve
 
+from actions import dispatch_action, set_server_instance
+from db.session import init_db
 from models import AckBody, Envelope, MsgBody
 from registry import DeviceRegistry
 
@@ -20,6 +22,7 @@ class WebSocketServer:
         self.port = port
         self.registry = DeviceRegistry()
         self.server_id = "server:core-agent"
+        set_server_instance(self)
 
     async def handle_register(self, websocket: ServerConnection, envelope: Envelope) -> None:
         client_type = envelope.body.get("client_type") or "unknown"
@@ -50,7 +53,12 @@ class WebSocketServer:
 
     async def handle_server_target(self, websocket: ServerConnection, envelope: Envelope) -> None:
         """Handles messages directed to 'server' or 'agent'."""
-        if envelope.type == "msg":
+        if envelope.type == "action":
+            # Execute registered action (reminder.*, task.*, event.*, query.sql, etc.)
+            result_envelope = await dispatch_action(envelope, self)
+            await websocket.send(result_envelope.to_json())
+
+        elif envelope.type == "msg":
             text = envelope.body.get("text", "")
             logger.info(f"🤖 [Agent Core] Processing message from {envelope.source}: '{text}'")
 
@@ -135,8 +143,8 @@ class WebSocketServer:
                 device_name=envelope.source,
             )
 
-        # Direct server processing
-        if envelope.target in ("server", "agent", self.server_id):
+        # Direct server processing or action execution
+        if envelope.target in ("server", "agent", self.server_id) or envelope.type == "action":
             await self.handle_server_target(websocket, envelope)
         else:
             # Route to target devices (or broadcast)
@@ -161,6 +169,14 @@ class WebSocketServer:
             self.registry.unregister(websocket)
 
     async def run(self) -> None:
+        # Initialize database tables on startup
+        try:
+            logger.info("Initializing database tables...")
+            await init_db()
+            logger.info("Database initialized successfully.")
+        except Exception as e:
+            logger.warning(f"Database initialization warning (will retry on operations): {e}")
+
         async with serve(self.handler, self.host, self.port) as server:
             logger.info(f"WebSocket Agent Hub running on ws://{self.host}:{self.port}")
             await server.serve_forever()
