@@ -2,51 +2,80 @@ import asyncio
 import json
 import logging
 from websockets.asyncio.client import connect
+from models import Envelope, MsgBody, CallBody, RegisterBody
 
-logging.basicConfig(level=logging.INFO, format="[Client] %(message)s")
+logging.basicConfig(level=logging.INFO, format="[Test] %(message)s")
 
 
-async def test_client():
+async def run_tests():
     uri = "ws://127.0.0.1:8765"
 
-    async with connect(uri) as client_a, connect(uri) as client_b:
-        print("\n--- Testing 'msg' (Text) ---")
-        msg_payload = {
-            "type": "msg",
-            "body": {
-                "text": "Hello from Client A!"
-            }
-        }
-        await client_a.send(json.dumps(msg_payload))
-        received_on_b = await client_b.recv()
-        print(f"Client B received: {received_on_b}")
-        parsed_b = json.loads(received_on_b)
-        assert parsed_b["type"] == "msg"
-        assert parsed_b["body"]["text"] == "Hello from Client A!"
+    async with connect(uri) as phone_ws, connect(uri) as laptop_ws:
+        # 1. Register Phone
+        phone_reg = Envelope.create(
+            type="register",
+            source="mobile:garvit-phone",
+            target="server",
+            body=RegisterBody(client_type="mobile", device_name="iPhone 15", capabilities=["audio", "notifications"]),
+        )
+        await phone_ws.send(phone_reg.to_json())
+        ack_phone = await phone_ws.recv()
+        logging.info(f"Phone registered: {ack_phone}")
 
-        print("\n--- Testing 'call' (Audio) ---")
-        call_payload = {
-            "type": "call",
-            "body": {
-                "audio": "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
-            }
-        }
-        await client_b.send(json.dumps(call_payload))
-        received_on_a = await client_a.recv()
-        print(f"Client A received: {received_on_a}")
-        parsed_a = json.loads(received_on_a)
-        assert parsed_a["type"] == "call"
-        assert parsed_a["body"]["audio"].startswith("UklGR")
+        # 2. Register Laptop
+        laptop_reg = Envelope.create(
+            type="register",
+            source="laptop:garvit-macbook",
+            target="server",
+            body=RegisterBody(client_type="laptop", device_name="MacBook Pro", capabilities=["cli", "terminal"]),
+        )
+        await laptop_ws.send(laptop_reg.to_json())
+        ack_laptop = await laptop_ws.recv()
+        logging.info(f"Laptop registered: {ack_laptop}")
 
-        print("\n--- Testing Error Handling (Invalid Payload) ---")
-        invalid_payload = {"type": "unknown_type", "body": {}}
-        await client_a.send(json.dumps(invalid_payload))
-        error_resp = await client_a.recv()
-        print(f"Client A received error: {error_resp}")
-        assert json.loads(error_resp)["type"] == "error"
+        # 3. Phone sends message to Laptop (Direct Routing)
+        direct_msg = Envelope.create(
+            type="msg",
+            source="mobile:garvit-phone",
+            target="laptop:garvit-macbook",
+            body=MsgBody(text="Run build on laptop"),
+        )
+        await phone_ws.send(direct_msg.to_json())
+        recv_on_laptop = await laptop_ws.recv()
+        logging.info(f"Laptop received direct msg: {recv_on_laptop}")
+        parsed_laptop = Envelope.from_json(recv_on_laptop)
+        assert parsed_laptop.body["text"] == "Run build on laptop"
+        assert parsed_laptop.source == "mobile:garvit-phone"
 
-        print("\nAll tests passed successfully!")
+        # 4. Laptop sends call to Mobile role (Role Targeting)
+        call_msg = Envelope.create(
+            type="call",
+            source="laptop:garvit-macbook",
+            target="mobile",
+            body=CallBody(audio="UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="),
+        )
+        await laptop_ws.send(call_msg.to_json())
+        recv_on_phone = await phone_ws.recv()
+        logging.info(f"Phone received call from laptop: {recv_on_phone}")
+        parsed_phone = Envelope.from_json(recv_on_phone)
+        assert parsed_phone.type == "call"
+        assert parsed_phone.source == "laptop:garvit-macbook"
+
+        # 5. Phone sends message to Server (Agent Processing)
+        server_msg = Envelope.create(
+            type="msg",
+            source="mobile:garvit-phone",
+            target="server",
+            body=MsgBody(text="What is my server status?"),
+        )
+        await phone_ws.send(server_msg.to_json())
+        recv_agent_reply = await phone_ws.recv()
+        logging.info(f"Phone received Agent reply: {recv_agent_reply}")
+        parsed_reply = Envelope.from_json(recv_agent_reply)
+        assert parsed_reply.source == "server:core-agent"
+
+        logging.info("✅ All envelope & routing tests passed!")
 
 
 if __name__ == "__main__":
-    asyncio.run(test_client())
+    asyncio.run(run_tests())
