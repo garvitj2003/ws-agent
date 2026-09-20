@@ -35,6 +35,9 @@ services:
       - WS_HOST=0.0.0.0
       - WS_PORT=8765
       - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-ws_agent_user}:${POSTGRES_PASSWORD:-ws_agent_password}@postgres:5432/${POSTGRES_DB:-ws_agent_db}
+      - TYPESAFE_API_KEY=${TYPESAFE_API_KEY:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - GROQ_MODEL=${GROQ_MODEL:-llama-3.3-70b-versatile}
     depends_on:
       postgres:
         condition: service_healthy

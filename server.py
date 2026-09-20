@@ -9,6 +9,7 @@ from typing import Set
 from websockets.asyncio.server import ServerConnection, serve
 
 from actions import dispatch_action, set_server_instance
+from brain import process_user_interaction
 from db.session import init_db
 from models import AckBody, Envelope, MsgBody
 from registry import DeviceRegistry
@@ -59,17 +60,7 @@ class WebSocketServer:
             await websocket.send(result_envelope.to_json())
 
         elif envelope.type == "msg":
-            text = envelope.body.get("text", "")
-            logger.info(f"🤖 [Agent Core] Processing message from {envelope.source}: '{text}'")
-
-            # Echo / agent acknowledgment response back to source
-            response_text = f"Agent received: '{text}'"
-            reply_envelope = Envelope.create(
-                type="msg",
-                source=self.server_id,
-                target=envelope.source,
-                body={"text": response_text},
-            )
+            reply_envelope = await process_user_interaction(envelope, self)
             await websocket.send(reply_envelope.to_json())
 
         elif envelope.type == "call":
