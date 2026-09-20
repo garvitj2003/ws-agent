@@ -78,6 +78,16 @@ async def process_user_interaction(envelope: Envelope, server_instance=None) -> 
     action_data: Dict[str, Any] = {}
 
     # Step 3: Pure Dynamic Execution (Strategy Dispatcher - 0 if/else statements)
+    dynamic_repo.last_trace = {
+        "entity": decision.entity,
+        "operation": decision.operation,
+        "sql_executed": f"-- Executing {decision.operation} on {decision.entity} --",
+        "sql_parameters": {},
+        "latency_ms": 0.0,
+        "rows_affected": 0,
+        "result_summary": "Pending database execution",
+    }
+
     try:
         async with get_db_session() as session:
             action_summary, action_data = await executor.execute(
@@ -90,6 +100,8 @@ async def process_user_interaction(envelope: Envelope, server_instance=None) -> 
     except Exception as exc:
         logger.error(f"Error executing dynamic action: {exc}", exc_info=True)
         action_summary = f"Attempted operation on {decision.entity} but encountered: {exc}"
+        dynamic_repo.last_trace["result_summary"] = f"Failed: {exc}"
+        dynamic_repo.last_trace["sql_executed"] = f"-- ERROR: {exc} --"
 
     # Step 4: Generate Friday's Voice Response via Groq (openai/gpt-oss-20b)
     friday_speech, groq_meta = await generate_friday_reply_detailed(

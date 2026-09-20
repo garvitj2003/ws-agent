@@ -69,15 +69,32 @@ class DynamicEntityRepository:
         return self._registry[key]
 
     def _auto_cast_fields(self, model_cls: Type[Base], raw_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Auto-casts input values to match the column types of the SQLAlchemy model."""
+        """Auto-casts input values to match the column types of the SQLAlchemy model with smart fallback defaults."""
         clean_data: Dict[str, Any] = {}
         table = model_cls.__table__
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         for col in table.columns:
             col_name = col.name
             # Accept camelCase or snake_case
             camel_name = "".join(word.capitalize() if i > 0 else word for i, word in enumerate(col_name.split("_")))
             val = raw_data.get(col_name) if col_name in raw_data else raw_data.get(camel_name)
+
+            # Synonym mappings for polymorphic model fields
+            if val is None:
+                if col_name == "content":
+                    val = raw_data.get("title") or raw_data.get("text") or raw_data.get("raw_text")
+                elif col_name == "title":
+                    val = raw_data.get("content") or raw_data.get("text") or raw_data.get("raw_text")
+                elif col_name in ("scheduled_at", "due_at", "start_time"):
+                    val = raw_data.get("scheduled_at") or raw_data.get("due_at") or raw_data.get("time")
+                    # If field is non-nullable and no time was provided, auto-default to 1 hour from now
+                    if val is None and not col.nullable:
+                        val = now + datetime.timedelta(hours=1)
+                elif col_name == "status" and not col.nullable:
+                    val = "pending"
+                elif col_name == "category" and not col.nullable:
+                    val = "general"
 
             if val is None:
                 continue
@@ -90,6 +107,10 @@ class DynamicEntityRepository:
                         if dt.tzinfo is None:
                             dt = dt.replace(tzinfo=datetime.timezone.utc)
                         clean_data[col_name] = dt
+                    elif isinstance(val, (datetime.datetime, datetime.date)):
+                        if isinstance(val, datetime.datetime) and val.tzinfo is None:
+                            val = val.replace(tzinfo=datetime.timezone.utc)
+                        clean_data[col_name] = val
                     else:
                         clean_data[col_name] = val
 
@@ -131,32 +152,45 @@ class DynamicEntityRepository:
         return data
 
     async def create(self, session: AsyncSession, entity: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Universal dynamic insert."""
+        """Universal dynamic insert with trace recording."""
         start_t = time.perf_counter()
         model_cls = self.get_model(entity)
         clean_data = self._auto_cast_fields(model_cls, data)
-        instance = model_cls(**clean_data)
-        session.add(instance)
-        await session.flush()
-        await session.refresh(instance)
-        serialized = self._serialize_record(instance)
-        elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
-
         table_name = model_cls.__tablename__
         cols = list(clean_data.keys())
         params_str = ", ".join(f":{c}" for c in cols)
         sql_sim = f"INSERT INTO {table_name} ({', '.join(cols)}) VALUES ({params_str}) RETURNING *"
 
-        self.last_trace = {
-            "entity": entity,
-            "operation": "create",
-            "sql_executed": sql_sim,
-            "sql_parameters": {k: (v.isoformat() if isinstance(v, (datetime.datetime, datetime.date)) else str(v)) for k, v in clean_data.items()},
-            "latency_ms": elapsed_ms,
-            "rows_affected": 1,
-            "result_summary": f"Created 1 {entity[:-1] if entity.endswith('s') else entity} record",
-        }
-        return serialized
+        try:
+            instance = model_cls(**clean_data)
+            session.add(instance)
+            await session.flush()
+            await session.refresh(instance)
+            serialized = self._serialize_record(instance)
+            elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+
+            self.last_trace = {
+                "entity": entity,
+                "operation": "create",
+                "sql_executed": sql_sim,
+                "sql_parameters": {k: (v.isoformat() if isinstance(v, (datetime.datetime, datetime.date)) else str(v)) for k, v in clean_data.items()},
+                "latency_ms": elapsed_ms,
+                "rows_affected": 1,
+                "result_summary": f"Created 1 {entity[:-1] if entity.endswith('s') else entity} record",
+            }
+            return serialized
+        except Exception as exc:
+            elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+            self.last_trace = {
+                "entity": entity,
+                "operation": "create",
+                "sql_executed": sql_sim,
+                "sql_parameters": {k: str(v) for k, v in clean_data.items()},
+                "latency_ms": elapsed_ms,
+                "rows_affected": 0,
+                "result_summary": f"Database error: {exc}",
+            }
+            raise
 
     async def get(self, session: AsyncSession, entity: str, record_id: str | uuid.UUID) -> Optional[Dict[str, Any]]:
         """Universal dynamic fetch by ID."""

@@ -57,5 +57,6 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db():
     """Initializes tables if not using Alembic migrations in test/standalone runs."""
+    import db.models  # noqa: F401 - registers Reminder, Task, Event, Device, Memory, ActionLog
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
