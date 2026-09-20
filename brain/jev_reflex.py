@@ -158,12 +158,16 @@ def _extract_dynamic_parameters(text: str, operation: str, entity: str) -> Dict[
         params["timeframe"] = "any"
 
     # Search Query / Entity extraction
-    # e.g. "cancel my meeting with Harvard", "what is my dog's name", "search task review PR"
-    match = re.search(r"(?:meeting with|remember that|remember|about|cancel|for|find|search|regarding)\s+(?:the\s+|my\s+)?([a-zA-Z0-9_\s'-]+)", text, flags=re.IGNORECASE)
-    if match:
-        params["search_query"] = match.group(1).strip()
+    # e.g. "cancel my meeting with Harvard", "who is the vet of my dog", "what is my dog's name"
+    if operation == "search":
+        cleaned_search = re.sub(r"^(who is|what is|whats|whos|where is|when is|tell me|show me|find|search for|about|can you tell me)\s+(?:the\s+|my\s+)?", "", text, flags=re.IGNORECASE).strip()
+        params["search_query"] = cleaned_search if cleaned_search else text.strip()
     else:
-        params["search_query"] = text.strip()
+        match = re.search(r"(?:meeting with|remember that|remember|about|cancel|for|find|search|regarding)\s+(?:the\s+|my\s+)?([a-zA-Z0-9_\s'-]+)", text, flags=re.IGNORECASE)
+        if match:
+            params["search_query"] = match.group(1).strip()
+        else:
+            params["search_query"] = text.strip()
 
     # Create / Data extraction
     if operation == "create":

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Type
@@ -258,12 +259,28 @@ class DynamicEntityRepository:
                 end_dt = start_dt + datetime.timedelta(days=1)
                 stmt = stmt.where(target_date_col >= start_dt, target_date_col < end_dt)
 
-        # 3. Apply Fuzzy Text Search (ILIKE across all string/text columns)
+        # 3. Apply Multi-Keyword Fuzzy Search
         if query:
+            stop_words = {
+                "who", "what", "where", "when", "why", "how", "is", "are", "was",
+                "were", "the", "a", "an", "of", "in", "on", "at", "to", "for",
+                "with", "my", "your", "his", "her", "their", "our", "tell", "me",
+                "show", "find", "search", "about", "please", "can", "you", "does", "do", "whats", "whos"
+            }
+            raw_tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
+            keywords = [tok for tok in raw_tokens if tok not in stop_words and len(tok) > 1]
+            if not keywords:
+                keywords = [query.strip()]
+
             text_cols = [getattr(model_cls, c.name) for c in table.columns if isinstance(c.type, (String, Text))]
             if text_cols:
-                pattern = f"%{query.strip()}%"
-                stmt = stmt.where(or_(*[col.ilike(pattern) for col in text_cols]))
+                conditions = []
+                for kw in keywords:
+                    pattern = f"%{kw}%"
+                    for col in text_cols:
+                        conditions.append(col.ilike(pattern))
+                if conditions:
+                    stmt = stmt.where(or_(*conditions))
 
         # 4. Default ordering
         if hasattr(model_cls, "scheduled_at"):
