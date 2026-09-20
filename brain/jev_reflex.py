@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -23,6 +24,7 @@ class JevDecision:
     urgency: str  # "routine", "important", "emergency"
     parameters: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0
+    latency_ms: float = 0.0
 
 
 async def evaluate_intent_with_jev(
@@ -36,9 +38,12 @@ async def evaluate_intent_with_jev(
     - Decides entity table (reminders, tasks, events, memories, none)
     - Evaluates safety & urgency in <40ms.
     """
+    start_t = time.perf_counter()
     if not has_typesafe_api_key():
         logger.info("TYPESAFE_API_KEY not found in environment; using dynamic heuristic reflex.")
-        return _heuristic_dynamic_reflex(user_input, source_device)
+        dec = _heuristic_dynamic_reflex(user_input, source_device)
+        dec.latency_ms = round((time.perf_counter() - start_t) * 1000, 2)
+        return dec
 
     try:
         async with AsyncTypeSafeClient(api_key=TYPESAFE_API_KEY) as client:
@@ -117,7 +122,8 @@ async def evaluate_intent_with_jev(
 
             params = _extract_dynamic_parameters(user_input, operation, entity)
 
-            logger.info(f"⚡ [Jev Dynamic] Op='{operation}', Entity='{entity}', Target='{target_device}', Destructive={is_destructive}")
+            latency_ms = round((time.perf_counter() - start_t) * 1000, 2)
+            logger.info(f"⚡ [Jev Dynamic] Op='{operation}', Entity='{entity}', Target='{target_device}', Destructive={is_destructive} ({latency_ms}ms)")
 
             return JevDecision(
                 operation=operation,
@@ -127,11 +133,14 @@ async def evaluate_intent_with_jev(
                 urgency=urgency_str,
                 parameters=params,
                 confidence=1.0,
+                latency_ms=latency_ms,
             )
 
     except Exception as exc:
         logger.error(f"Error evaluating with Jev API: {exc}. Falling back to dynamic heuristic reflex.", exc_info=True)
-        return _heuristic_dynamic_reflex(user_input, source_device)
+        dec = _heuristic_dynamic_reflex(user_input, source_device)
+        dec.latency_ms = round((time.perf_counter() - start_t) * 1000, 2)
+        return dec
 
 
 def _extract_dynamic_parameters(text: str, operation: str, entity: str) -> Dict[str, Any]:

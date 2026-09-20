@@ -29,17 +29,22 @@ def _clean_model_output(text: str) -> str:
     return cleaned
 
 
-async def generate_friday_reply(
+import time
+
+async def generate_friday_reply_detailed(
     user_input: str,
     action_summary: str,
     context: Optional[Dict[str, Any]] = None,
-) -> str:
+) -> tuple[str, Dict[str, Any]]:
     """
-    Generates a natural, conversational Friday response based on the completed action.
+    Generates Friday response and returns both the speech text and execution metadata.
     """
+    start_t = time.perf_counter()
     if not has_groq_api_key():
         logger.info("GROQ_API_KEY not found in environment; using template fallback.")
-        return _fallback_reply(user_input, action_summary)
+        reply = _fallback_reply(user_input, action_summary)
+        latency_ms = round((time.perf_counter() - start_t) * 1000, 2)
+        return reply, {"model": "fallback_template", "latency_ms": latency_ms}
 
     try:
         groq_client = AsyncGroq(api_key=GROQ_API_KEY)
@@ -67,16 +72,37 @@ async def generate_friday_reply(
         raw_content = message.content or ""
         reply = _clean_model_output(raw_content)
 
+        latency_ms = round((time.perf_counter() - start_t) * 1000, 2)
+
         if not reply:
             logger.warning("Groq model returned empty message content, falling back to template reply.")
-            return _fallback_reply(user_input, action_summary)
+            return _fallback_reply(user_input, action_summary), {
+                "model": GROQ_MODEL,
+                "latency_ms": latency_ms,
+                "fallback": True,
+            }
 
-        logger.info(f"🗣️ [Friday Voice/Groq] Generated reply: '{reply}'")
-        return reply
+        logger.info(f"🗣️ [Friday Voice/Groq] Generated reply ({latency_ms}ms): '{reply}'")
+        return reply, {"model": GROQ_MODEL, "latency_ms": latency_ms, "fallback": False}
 
     except Exception as exc:
+        latency_ms = round((time.perf_counter() - start_t) * 1000, 2)
         logger.error(f"Error calling Groq API ({GROQ_MODEL}): {exc}. Using fallback response.", exc_info=True)
-        return _fallback_reply(user_input, action_summary)
+        return _fallback_reply(user_input, action_summary), {
+            "model": GROQ_MODEL,
+            "latency_ms": latency_ms,
+            "error": str(exc),
+        }
+
+
+async def generate_friday_reply(
+    user_input: str,
+    action_summary: str,
+    context: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Convenience function returning only the string response."""
+    reply, _ = await generate_friday_reply_detailed(user_input, action_summary, context)
+    return reply
 
 
 def _fallback_reply(user_input: str, action_summary: str) -> str:

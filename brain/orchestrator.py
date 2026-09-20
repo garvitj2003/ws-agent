@@ -1,9 +1,12 @@
-from __future__ import annotations
-
+import datetime
 import logging
+import time
+import uuid
 from typing import Any, Dict
 
-from brain.groq_voice import generate_friday_reply
+from brain.config import DEBUG_STREAM
+from brain.executor import executor
+from brain.groq_voice import generate_friday_reply_detailed
 from brain.jev_reflex import evaluate_intent_with_jev
 from db.dynamic_repo import dynamic_repo
 from db.session import get_db_session
@@ -15,10 +18,13 @@ logger = logging.getLogger("brain_orchestrator")
 async def process_user_interaction(envelope: Envelope, server_instance=None) -> Envelope:
     """
     Universal metadata-driven execution pipeline:
-    1. Jev System 1: Determines operation ('create', 'search', 'update', 'delete', 'overview') and entity ('reminders', 'tasks', 'memories', etc.).
-    2. Dynamic Repository: Executes strongly-typed ORM operations on PostgreSQL.
-    3. Groq Voice: Streams charismatic Friday conversational response.
+    1. Ingest request & initialize telemetry trace.
+    2. Jev System 1: Determines operation and entity in <40ms.
+    3. Dynamic Repository: Executes strongly-typed ORM operations on PostgreSQL.
+    4. Groq Voice: Streams charismatic Friday conversational response.
+    5. Telemetry Broadcast: Streams full debug trace to connected laptop(s).
     """
+    pipeline_start = time.perf_counter()
     user_text = envelope.body.get("text", "")
     if not user_text:
         return Envelope.create(
@@ -36,118 +42,57 @@ async def process_user_interaction(envelope: Envelope, server_instance=None) -> 
     # Step 2: Safety Gate Check
     if decision.is_destructive:
         logger.warning(f"🚫 [Safety Gate] Blocked destructive action for input: '{user_text}'")
-        reply = await generate_friday_reply(
+        friday_speech, groq_meta = await generate_friday_reply_detailed(
             user_input=user_text,
             action_summary="Action blocked because it was flagged as potentially destructive or high-risk.",
         )
-        return Envelope.create(
+        reply_env = Envelope.create(
             type="msg",
             source="server:friday-agent",
             target=envelope.source,
-            body=MsgBody(text=reply),
+            body=MsgBody(text=friday_speech),
         )
+
+        if DEBUG_STREAM and server_instance:
+            trace_payload = {
+                "trace_id": f"tr_{uuid.uuid4().hex[:8]}",
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "request": {"source": envelope.source, "target": envelope.target, "text": user_text, "envelope_id": envelope.id},
+                "jev_system1": {
+                    "operation": decision.operation,
+                    "entity": decision.entity,
+                    "is_destructive": decision.is_destructive,
+                    "urgency": decision.urgency,
+                    "latency_ms": decision.latency_ms,
+                },
+                "database": {"operation": "blocked", "sql_executed": "-- BLOCKED BY SAFETY GATE --", "latency_ms": 0.0},
+                "groq_system2": {"model": groq_meta.get("model", "openai/gpt-oss-20b"), "speech_reply": friday_speech, "latency_ms": groq_meta.get("latency_ms", 0.0)},
+                "total_pipeline_ms": round((time.perf_counter() - pipeline_start) * 1000, 2),
+            }
+            trace_env = Envelope.create(type="debug_trace", source="server:friday-agent", target="laptop", body=trace_payload)
+            await server_instance.route_envelope(None, trace_env)
+
+        return reply_env
 
     action_summary = "Processed request."
     action_data: Dict[str, Any] = {}
 
-    # Step 3: Dynamic Universal Execution Layer
+    # Step 3: Pure Dynamic Execution (Strategy Dispatcher - 0 if/else statements)
     try:
         async with get_db_session() as session:
-            # A. Agenda / Schedule Overview
-            if decision.operation == "overview":
-                overview = await dynamic_repo.get_agenda_overview(session)
-                action_data = overview
-
-                reminders = [r.get("title", "") for r in overview["reminders"]]
-                tasks = [t.get("title", "") for t in overview["tasks"]]
-                events = [e.get("title", "") for e in overview["events"]]
-
-                if overview["total_items"] == 0:
-                    action_summary = "Your schedule is completely clear for today. No pending reminders, tasks, or events."
-                else:
-                    parts = []
-                    if events:
-                        parts.append(f"Events: {', '.join(events)}")
-                    if reminders:
-                        parts.append(f"Reminders: {', '.join(reminders)}")
-                    if tasks:
-                        parts.append(f"Pending tasks: {', '.join(tasks)}")
-                    action_summary = f"Agenda overview: {'; '.join(parts)}."
-
-            # B. Universal Create (reminders, tasks, memories, events, etc.)
-            elif decision.operation == "create" and decision.entity != "none":
-                data = decision.parameters.get("data") or {"title": user_text}
-                created_record = await dynamic_repo.create(session, decision.entity, data)
-                action_data = created_record
-                item_label = created_record.get("title") or created_record.get("content") or decision.entity
-                action_summary = f"Created new {decision.entity[:-1] if decision.entity.endswith('s') else decision.entity}: '{item_label}'."
-
-            # C. Universal Search (recall memories, search tasks/reminders)
-            elif decision.operation == "search" and decision.entity != "none":
-                search_query = decision.parameters.get("search_query", user_text)
-                timeframe = decision.parameters.get("timeframe", "any")
-                results = await dynamic_repo.search(
-                    session=session,
-                    entity=decision.entity,
-                    query=search_query,
-                    timeframe=timeframe,
-                    limit=5,
-                )
-                action_data = {"count": len(results), "results": results}
-                if results:
-                    found_items = [r.get("content") or r.get("title") for r in results]
-                    action_summary = f"Found matching {decision.entity}: {', '.join(str(x) for x in found_items)}."
-                else:
-                    action_summary = f"No matching records found in {decision.entity} for query '{search_query}'."
-
-            # D. Universal Update (e.g. cancel meeting, complete task)
-            elif decision.operation == "update" and decision.entity != "none":
-                search_query = decision.parameters.get("search_query", "")
-                timeframe = decision.parameters.get("timeframe", "any")
-                updates = decision.parameters.get("updates", {})
-
-                res = await dynamic_repo.search_and_update(
-                    session=session,
-                    entity=decision.entity,
-                    search_query=search_query,
-                    timeframe=timeframe,
-                    updates=updates,
-                )
-                action_data = res
-                if res.get("found"):
-                    updated_rec = res.get("record", {})
-                    item_label = updated_rec.get("title") or updated_rec.get("content") or "record"
-                    new_status = updates.get("status", "updated")
-                    action_summary = f"Updated {decision.entity[:-1] if decision.entity.endswith('s') else decision.entity} '{item_label}' to status '{new_status}'."
-                else:
-                    action_summary = f"Could not find any matching {decision.entity} to update for '{search_query}'."
-
-            # E. Device Action
-            elif decision.operation == "device_action":
-                if server_instance:
-                    target_device = decision.target_device if decision.target_device != "server" else "laptop"
-                    laptop_envelope = Envelope.create(
-                        type="action",
-                        source=envelope.source,
-                        target=target_device,
-                        body={"action": "exec", "command": user_text},
-                    )
-                    recipients = server_instance.registry.resolve_targets(target_device)
-                    if recipients:
-                        await server_instance.route_envelope(None, laptop_envelope)
-                        action_summary = f"Dispatched execution command to {target_device}."
-                    else:
-                        action_summary = f"{target_device.capitalize()} is currently offline."
-
-            else:
-                action_summary = "Conversational chat."
-
+            action_summary, action_data = await executor.execute(
+                session=session,
+                decision=decision,
+                user_text=user_text,
+                server_instance=server_instance,
+                envelope=envelope,
+            )
     except Exception as exc:
         logger.error(f"Error executing dynamic action: {exc}", exc_info=True)
         action_summary = f"Attempted operation on {decision.entity} but encountered: {exc}"
 
     # Step 4: Generate Friday's Voice Response via Groq (openai/gpt-oss-20b)
-    friday_speech = await generate_friday_reply(
+    friday_speech, groq_meta = await generate_friday_reply_detailed(
         user_input=user_text,
         action_summary=action_summary,
         context={
@@ -158,7 +103,57 @@ async def process_user_interaction(envelope: Envelope, server_instance=None) -> 
         },
     )
 
-    # Step 5: Package and Deliver Response Envelope
+    total_pipeline_ms = round((time.perf_counter() - pipeline_start) * 1000, 2)
+
+    # Step 5: Broadcast Telemetry Debug Trace to Laptop
+    if DEBUG_STREAM and server_instance:
+        db_trace = dynamic_repo.get_last_trace() or {
+            "entity": decision.entity,
+            "operation": decision.operation,
+            "sql_executed": "-- No database operation executed --",
+            "sql_parameters": {},
+            "latency_ms": 0.0,
+            "rows_affected": 0,
+            "result_summary": "No direct DB query",
+        }
+
+        trace_payload = {
+            "trace_id": f"tr_{uuid.uuid4().hex[:8]}",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "request": {
+                "source": envelope.source,
+                "target": envelope.target,
+                "text": user_text,
+                "envelope_id": envelope.id,
+            },
+            "jev_system1": {
+                "operation": decision.operation,
+                "entity": decision.entity,
+                "target_device": decision.target_device,
+                "is_destructive": decision.is_destructive,
+                "urgency": decision.urgency,
+                "parameters": decision.parameters,
+                "latency_ms": decision.latency_ms,
+            },
+            "database": db_trace,
+            "groq_system2": {
+                "model": groq_meta.get("model", "openai/gpt-oss-20b"),
+                "speech_reply": friday_speech,
+                "latency_ms": groq_meta.get("latency_ms", 0.0),
+            },
+            "total_pipeline_ms": total_pipeline_ms,
+        }
+
+        trace_env = Envelope.create(
+            type="debug_trace",
+            source="server:friday-agent",
+            target="laptop",
+            body=trace_payload,
+        )
+        logger.info(f"📊 [Telemetry] Streaming debug trace {trace_payload['trace_id']} ({total_pipeline_ms}ms) to laptop")
+        await server_instance.route_envelope(None, trace_env)
+
+    # Step 6: Package and Deliver Response Envelope
     return Envelope.create(
         type="msg",
         source="server:friday-agent",

@@ -2,16 +2,37 @@ from __future__ import annotations
 
 import datetime
 import logging
-import uuid
+import time
 from typing import Any, Dict, List, Optional, Type
 
 from sqlalchemy import DateTime, Integer, String, Text, delete, desc, or_, select, update
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PgUUID
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import ActionLog, Base, Device, Event, Memory, Reminder, Task
 
 logger = logging.getLogger("dynamic_repo")
+
+
+def compile_statement(stmt) -> Dict[str, Any]:
+    """Compiles a SQLAlchemy statement into formatted SQL string and bound parameters."""
+    try:
+        compiled = stmt.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"render_postcompile": True}
+        )
+        params = {}
+        for k, v in (compiled.params or {}).items():
+            if isinstance(v, (datetime.datetime, datetime.date)):
+                params[k] = v.isoformat()
+            elif isinstance(v, uuid.UUID):
+                params[k] = str(v)
+            else:
+                params[k] = v
+        return {"sql": str(compiled), "params": params}
+    except Exception as e:
+        return {"sql": str(stmt), "params": {}}
 
 
 class DynamicEntityRepository:
@@ -31,6 +52,11 @@ class DynamicEntityRepository:
             "action_logs": ActionLog,
             "action_log": ActionLog,
         }
+        self.last_trace: Dict[str, Any] = {}
+
+    def get_last_trace(self) -> Dict[str, Any]:
+        """Returns the most recent database execution telemetry trace."""
+        return self.last_trace
 
     def get_available_entities(self) -> List[str]:
         """Returns unique list of entity collection names."""
@@ -106,23 +132,55 @@ class DynamicEntityRepository:
 
     async def create(self, session: AsyncSession, entity: str, data: Dict[str, Any]) -> Dict[str, Any]:
         """Universal dynamic insert."""
+        start_t = time.perf_counter()
         model_cls = self.get_model(entity)
         clean_data = self._auto_cast_fields(model_cls, data)
         instance = model_cls(**clean_data)
         session.add(instance)
         await session.flush()
         await session.refresh(instance)
-        return self._serialize_record(instance)
+        serialized = self._serialize_record(instance)
+        elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+
+        table_name = model_cls.__tablename__
+        cols = list(clean_data.keys())
+        params_str = ", ".join(f":{c}" for c in cols)
+        sql_sim = f"INSERT INTO {table_name} ({', '.join(cols)}) VALUES ({params_str}) RETURNING *"
+
+        self.last_trace = {
+            "entity": entity,
+            "operation": "create",
+            "sql_executed": sql_sim,
+            "sql_parameters": {k: (v.isoformat() if isinstance(v, (datetime.datetime, datetime.date)) else str(v)) for k, v in clean_data.items()},
+            "latency_ms": elapsed_ms,
+            "rows_affected": 1,
+            "result_summary": f"Created 1 {entity[:-1] if entity.endswith('s') else entity} record",
+        }
+        return serialized
 
     async def get(self, session: AsyncSession, entity: str, record_id: str | uuid.UUID) -> Optional[Dict[str, Any]]:
         """Universal dynamic fetch by ID."""
+        start_t = time.perf_counter()
         model_cls = self.get_model(entity)
         if isinstance(record_id, str):
             try:
                 record_id = uuid.UUID(record_id)
             except ValueError:
                 pass
+        stmt = select(model_cls).where(getattr(model_cls, "id") == record_id)
+        compiled = compile_statement(stmt)
         instance = await session.get(model_cls, record_id)
+        elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+
+        self.last_trace = {
+            "entity": entity,
+            "operation": "get",
+            "sql_executed": compiled["sql"],
+            "sql_parameters": compiled["params"],
+            "latency_ms": elapsed_ms,
+            "rows_affected": 1 if instance else 0,
+            "result_summary": "Record found" if instance else "Record not found",
+        }
         return self._serialize_record(instance) if instance else None
 
     async def search(
@@ -140,6 +198,7 @@ class DynamicEntityRepository:
         - Auto-applies ILIKE across all string/text columns
         - Auto-applies date filtering (today, tomorrow) on DateTime columns
         """
+        start_t = time.perf_counter()
         model_cls = self.get_model(entity)
         table = model_cls.__table__
         stmt = select(model_cls)
@@ -177,9 +236,23 @@ class DynamicEntityRepository:
         elif hasattr(model_cls, "created_at"):
             stmt = stmt.order_by(getattr(model_cls, "created_at").desc())
 
-        result = await session.execute(stmt.limit(limit))
+        final_stmt = stmt.limit(limit)
+        compiled = compile_statement(final_stmt)
+        result = await session.execute(final_stmt)
         records = result.scalars().all()
-        return [self._serialize_record(r) for r in records]
+        elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+
+        serialized = [self._serialize_record(r) for r in records]
+        self.last_trace = {
+            "entity": entity,
+            "operation": "search",
+            "sql_executed": compiled["sql"],
+            "sql_parameters": compiled["params"],
+            "latency_ms": elapsed_ms,
+            "rows_affected": len(serialized),
+            "result_summary": f"Retrieved {len(serialized)} matching {entity} records",
+        }
+        return serialized
 
     async def update(
         self,
@@ -189,6 +262,7 @@ class DynamicEntityRepository:
         updates: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """Universal dynamic update by ID."""
+        start_t = time.perf_counter()
         model_cls = self.get_model(entity)
         if isinstance(record_id, str):
             try:
@@ -198,6 +272,15 @@ class DynamicEntityRepository:
 
         instance = await session.get(model_cls, record_id)
         if not instance:
+            self.last_trace = {
+                "entity": entity,
+                "operation": "update",
+                "sql_executed": f"SELECT * FROM {model_cls.__tablename__} WHERE id = '{record_id}'",
+                "sql_parameters": {"id": str(record_id)},
+                "latency_ms": round((time.perf_counter() - start_t) * 1000, 2),
+                "rows_affected": 0,
+                "result_summary": "Record not found for update",
+            }
             return None
 
         clean_updates = self._auto_cast_fields(model_cls, updates)
@@ -209,7 +292,24 @@ class DynamicEntityRepository:
 
         await session.flush()
         await session.refresh(instance)
-        return self._serialize_record(instance)
+        elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+        serialized = self._serialize_record(instance)
+
+        set_clauses = ", ".join(f"{k} = :{k}" for k in clean_updates.keys())
+        sql_sim = f"UPDATE {model_cls.__tablename__} SET {set_clauses} WHERE id = :id"
+        self.last_trace = {
+            "entity": entity,
+            "operation": "update",
+            "sql_executed": sql_sim,
+            "sql_parameters": {
+                **{k: (v.isoformat() if isinstance(v, (datetime.datetime, datetime.date)) else str(v)) for k, v in clean_updates.items()},
+                "id": str(record_id),
+            },
+            "latency_ms": elapsed_ms,
+            "rows_affected": 1,
+            "result_summary": f"Updated {entity[:-1] if entity.endswith('s') else entity} '{record_id}'",
+        }
+        return serialized
 
     async def search_and_update(
         self,
@@ -220,6 +320,7 @@ class DynamicEntityRepository:
         updates: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Finds matching record by query/timeframe and applies updates."""
+        start_t = time.perf_counter()
         matches = await self.search(
             session=session,
             entity=entity,
@@ -228,15 +329,38 @@ class DynamicEntityRepository:
             timeframe=timeframe,
             limit=1,
         )
+        search_trace = dict(self.last_trace)
         if not matches:
+            self.last_trace = {
+                "entity": entity,
+                "operation": "search_and_update",
+                "sql_executed": search_trace.get("sql_executed", ""),
+                "sql_parameters": search_trace.get("sql_parameters", {}),
+                "latency_ms": round((time.perf_counter() - start_t) * 1000, 2),
+                "rows_affected": 0,
+                "result_summary": f"No pending {entity} matched '{search_query}'",
+            }
             return {"found": False, "search_query": search_query, "timeframe": timeframe}
 
         target_id = matches[0]["id"]
         updated = await self.update(session, entity, target_id, updates or {})
+        update_trace = dict(self.last_trace)
+
+        combined_sql = f"{search_trace.get('sql_executed', '')}\n--> {update_trace.get('sql_executed', '')}"
+        self.last_trace = {
+            "entity": entity,
+            "operation": "search_and_update",
+            "sql_executed": combined_sql,
+            "sql_parameters": {**search_trace.get("sql_parameters", {}), **update_trace.get("sql_parameters", {})},
+            "latency_ms": round((time.perf_counter() - start_t) * 1000, 2),
+            "rows_affected": 1,
+            "result_summary": f"Found & updated 1 {entity[:-1] if entity.endswith('s') else entity} matching '{search_query}'",
+        }
         return {"found": True, "record": updated}
 
     async def delete(self, session: AsyncSession, entity: str, record_id: str | uuid.UUID) -> bool:
         """Universal dynamic delete by ID."""
+        start_t = time.perf_counter()
         model_cls = self.get_model(entity)
         if isinstance(record_id, str):
             try:
@@ -244,15 +368,40 @@ class DynamicEntityRepository:
             except ValueError:
                 pass
         stmt = delete(model_cls).where(getattr(model_cls, "id") == record_id)
+        compiled = compile_statement(stmt)
         res = await session.execute(stmt)
-        return (res.rowcount or 0) > 0
+        elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+        rowcount = res.rowcount or 0
+
+        self.last_trace = {
+            "entity": entity,
+            "operation": "delete",
+            "sql_executed": compiled["sql"],
+            "sql_parameters": compiled["params"],
+            "latency_ms": elapsed_ms,
+            "rows_affected": rowcount,
+            "result_summary": f"Deleted {rowcount} record(s) from {entity}",
+        }
+        return rowcount > 0
 
     async def get_agenda_overview(self, session: AsyncSession) -> Dict[str, Any]:
         """Universal schedule & daily briefing aggregator."""
+        start_t = time.perf_counter()
         reminders = await self.search(session, "reminders", filters={"status": "pending"}, limit=10)
         tasks = await self.search(session, "tasks", filters={"status": "pending"}, limit=10)
         events = await self.search(session, "events", limit=10)
         memories = await self.search(session, "memories", limit=5)
+        elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
+
+        self.last_trace = {
+            "entity": "all_agenda_entities",
+            "operation": "overview",
+            "sql_executed": "SELECT * FROM reminders WHERE status='pending'; SELECT * FROM tasks WHERE status='pending'; SELECT * FROM events; SELECT * FROM memories;",
+            "sql_parameters": {"status": "pending"},
+            "latency_ms": elapsed_ms,
+            "rows_affected": len(reminders) + len(tasks) + len(events),
+            "result_summary": f"Aggregated {len(reminders)} reminders, {len(tasks)} tasks, {len(events)} events",
+        }
 
         return {
             "reminders": reminders,
