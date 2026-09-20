@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime
 import logging
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Type
 
 from sqlalchemy import DateTime, Integer, String, Text, delete, desc, or_, select, update
