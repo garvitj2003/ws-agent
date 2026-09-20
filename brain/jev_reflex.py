@@ -15,7 +15,7 @@ logger = logging.getLogger("jev_reflex")
 
 @dataclass
 class JevDecision:
-    intent: str  # "reminder_create", "reminder_cancel", "task_create", "task_complete", "device_action", "general_chat", "query_sql"
+    intent: str  # "agenda_overview", "reminder_create", "reminder_cancel", "task_create", "task_complete", "device_action", "general_chat", "query_sql"
     target_device: str  # "server", "mobile", "laptop", "broadcast"
     is_destructive: bool
     urgency: str  # "routine", "important", "emergency"
@@ -52,12 +52,13 @@ async def evaluate_intent_with_jev(
                     "intent": Choice(
                         instructions="What is the user's primary intended action?",
                         criteria={
+                            "agenda_overview": "User is asking for their daily briefing, what's on their plate, today's schedule, pending tasks or agenda",
                             "reminder_create": "User wants to create, schedule, or set a reminder or meeting",
                             "reminder_cancel": "User wants to cancel, ditch, clear, or remove an existing meeting or reminder",
                             "task_create": "User wants to create or add a new task, todo, or work item",
                             "task_complete": "User wants to mark a task as completed or done",
                             "device_action": "User wants to execute a command or check status on laptop or server",
-                            "query_sql": "User is asking for database analytics or records",
+                            "query_sql": "User is asking for custom database analytics",
                             "general_chat": "General greeting, conversational question, or casual chat",
                         },
                     ),
@@ -65,7 +66,7 @@ async def evaluate_intent_with_jev(
                     "target_device": Choice(
                         instructions="Which device should execute or receive this action?",
                         criteria={
-                            "server": "Server handles database, agent reasoning, or schedule storage",
+                            "server": "Server handles database, agenda, agent reasoning, or schedule storage",
                             "mobile": "Mobile phone (e.g. notify, ring, or mobile action)",
                             "laptop": "User's laptop/MacBook (e.g. code, terminal, git, build)",
                             "broadcast": "All connected devices",
@@ -88,11 +89,9 @@ async def evaluate_intent_with_jev(
             is_destructive = response.nouls["is_destructive"].noul
             urgency_score = response.scores["urgency"].score
 
-            # Map score to label
             urgency_labels = ["routine", "important", "emergency"]
             urgency_str = urgency_labels[min(max(urgency_score, 0), len(urgency_labels) - 1)]
 
-            # Extract basic parameters based on classified intent
             params = _extract_parameters(user_input, intent)
 
             logger.info(f"⚡ [Jev System 1] Intent='{intent}', Target='{target_device}', Destructive={is_destructive}, Urgency='{urgency_str}'")
@@ -112,20 +111,17 @@ async def evaluate_intent_with_jev(
 
 
 def _extract_parameters(text: str, intent: str) -> Dict[str, Any]:
-    """Helper to extract structured parameters like title, date, priority from natural text."""
+    """Helper to extract structured parameters like entity name, dates, title from natural text."""
     params: Dict[str, Any] = {}
     lower_text = text.lower()
 
     if intent in ("reminder_create", "task_create"):
-        # Extract title
         cleaned = re.sub(r"^(hey friday|friday|remind me to|remind me|create task to|add task)\s*", "", text, flags=re.IGNORECASE).strip()
         params["title"] = cleaned if cleaned else text
 
-        # Default schedule time: 1 hour from now or next day
         now = datetime.datetime.now(datetime.timezone.utc)
         if "tomorrow" in lower_text or "tmrw" in lower_text:
             scheduled_time = now + datetime.timedelta(days=1)
-            # Default to 1:00 PM if "1pm" or "1:00" mentioned
             if "1pm" in lower_text or "1 pm" in lower_text or "1:00" in lower_text:
                 scheduled_time = scheduled_time.replace(hour=13, minute=0, second=0, microsecond=0)
             elif "12:50" in lower_text or "12.50" in lower_text:
@@ -136,8 +132,28 @@ def _extract_parameters(text: str, intent: str) -> Dict[str, Any]:
         params["scheduledAt"] = scheduled_time.isoformat()
 
     elif intent == "reminder_cancel":
-        params["action"] = "cancel_latest_meeting"
-        params["reason"] = text
+        # Extract entity/client name (e.g. "Harvard", "client", "dentist")
+        match = re.search(r"(?:meeting with|cancel my|cancel|clear|ditch)\s+(?:the\s+)?([a-zA-Z0-9_-]+)", text, flags=re.IGNORECASE)
+        if match:
+            extracted = match.group(1).strip()
+            if extracted.lower() not in ("my", "the", "a", "our", "meeting", "reminder"):
+                params["search_text"] = extracted
+
+        # Extract timeframe
+        if "tomorrow" in lower_text or "tmrw" in lower_text:
+            params["timeframe"] = "tomorrow"
+        elif "today" in lower_text:
+            params["timeframe"] = "today"
+        else:
+            params["timeframe"] = "any"
+
+        params["raw_text"] = text
+
+    elif intent == "agenda_overview":
+        if "tomorrow" in lower_text or "tmrw" in lower_text:
+            params["timeframe"] = "tomorrow"
+        else:
+            params["timeframe"] = "today"
 
     return params
 
@@ -146,7 +162,9 @@ def _heuristic_fallback_reflex(text: str, source_device: str) -> JevDecision:
     """Fallback rule-based reflex when API key is not yet set."""
     lower = text.lower()
 
-    if any(k in lower for k in ("ditched", "cancel meeting", "clear meeting", "cancel reminder", "remove meeting")):
+    if any(k in lower for k in ("on my plate", "daily briefing", "my schedule", "what do i have", "agenda", "whats on my")):
+        intent = "agenda_overview"
+    elif any(k in lower for k in ("ditched", "cancel meeting", "clear meeting", "cancel reminder", "remove meeting", "cancel my")):
         intent = "reminder_cancel"
     elif any(k in lower for k in ("meeting", "remind", "reminder", "schedule", "appointment")):
         intent = "reminder_create"

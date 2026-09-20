@@ -4,7 +4,7 @@ import datetime
 import uuid
 from typing import Any
 
-from sqlalchemy import delete, desc, select, update
+from sqlalchemy import delete, desc, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import ActionLog, Device, Event, Reminder, Task
@@ -93,6 +93,51 @@ async def delete_reminder(session: AsyncSession, reminder_id: str | uuid.UUID) -
     stmt = delete(Reminder).where(Reminder.id == reminder_id)
     res = await session.execute(stmt)
     return (res.rowcount or 0) > 0
+
+
+async def cancel_matching_reminder(
+    session: AsyncSession,
+    search_text: str = "",
+    timeframe: str = "any",
+) -> dict[str, Any]:
+    """
+    Finds and cancels pending reminders matching search_text (e.g. 'Harvard')
+    with optional date timeframe scoping ('today', 'tomorrow', 'any').
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    stmt = select(Reminder).where(Reminder.status == "pending")
+
+    if timeframe == "today":
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + datetime.timedelta(days=1)
+        stmt = stmt.where(Reminder.scheduled_at >= start_of_day, Reminder.scheduled_at < end_of_day)
+    elif timeframe == "tomorrow":
+        start_of_tomorrow = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_tomorrow = start_of_tomorrow + datetime.timedelta(days=1)
+        stmt = stmt.where(Reminder.scheduled_at >= start_of_tomorrow, Reminder.scheduled_at < end_of_tomorrow)
+
+    if search_text:
+        search_pattern = f"%{search_text.strip()}%"
+        stmt = stmt.where(or_(Reminder.title.ilike(search_pattern), Reminder.description.ilike(search_pattern)))
+
+    stmt = stmt.order_by(Reminder.scheduled_at.asc()).limit(1)
+    result = await session.execute(stmt)
+    reminder = result.scalar_one_or_none()
+
+    if reminder:
+        reminder.status = "cancelled"
+        reminder.updated_at = now
+        await session.flush()
+        await session.refresh(reminder)
+        return {
+            "found": True,
+            "id": str(reminder.id),
+            "title": reminder.title,
+            "scheduledAt": reminder.scheduled_at.isoformat(),
+            "status": "cancelled",
+        }
+
+    return {"found": False, "search_text": search_text, "timeframe": timeframe}
 
 
 # =========================================================
@@ -214,6 +259,45 @@ async def delete_event(session: AsyncSession, event_id: str | uuid.UUID) -> bool
     stmt = delete(Event).where(Event.id == event_id)
     res = await session.execute(stmt)
     return (res.rowcount or 0) > 0
+
+
+# =========================================================
+# Daily Agenda / Schedule Aggregator
+# =========================================================
+async def get_daily_agenda(session: AsyncSession) -> dict[str, Any]:
+    """Fetches combined active agenda: pending reminders, tasks, and upcoming events."""
+    reminders = await list_reminders(session, status="pending", limit=10)
+    tasks = await list_tasks(session, status="pending", limit=10)
+    events = await list_events(session, limit=10)
+
+    return {
+        "pending_reminders": [
+            {
+                "id": str(r.id),
+                "title": r.title,
+                "scheduledAt": r.scheduled_at.isoformat(),
+            }
+            for r in reminders
+        ],
+        "pending_tasks": [
+            {
+                "id": str(t.id),
+                "title": t.title,
+                "priority": t.priority,
+            }
+            for t in tasks
+        ],
+        "events": [
+            {
+                "id": str(e.id),
+                "title": e.title,
+                "startTime": e.start_time.isoformat(),
+                "location": e.location,
+            }
+            for e in events
+        ],
+        "total_items": len(reminders) + len(tasks) + len(events),
+    }
 
 
 # =========================================================

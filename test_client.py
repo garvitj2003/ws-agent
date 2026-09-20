@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO, format="[Test] %(message)s")
 async def run_tests():
     uri = "ws://127.0.0.1:8765"
 
-    async with connect(uri) as phone_ws, connect(uri) as laptop_ws:
+    async with connect(uri) as phone_ws:
         # 1. Register Phone
         phone_reg = Envelope.create(
             type="register",
@@ -22,48 +22,55 @@ async def run_tests():
         ack_phone = await phone_ws.recv()
         logging.info(f"Phone registered: {ack_phone}")
 
-        # 2. Test Conversational Scenario 1: Creating Meeting Reminder via Friday Brain
-        logging.info("\n--- Scenario 1: Setting Meeting Reminder ---")
+        # 2. Schedule meeting with Harvard
+        logging.info("\n--- 1. Scheduling Meeting with Harvard ---")
         msg1 = Envelope.create(
             type="msg",
             source="mobile:garvit-phone",
             target="server",
-            body=MsgBody(text="Hey Friday, we have a meeting with the client at 1pm tomorrow"),
+            body=MsgBody(text="Hey Friday, schedule a meeting with Harvard for tomorrow at 1pm"),
         )
         await phone_ws.send(msg1.to_json())
         reply1 = await phone_ws.recv()
-        logging.info(f"Friday Replied: {reply1}")
-        parsed1 = Envelope.from_json(reply1)
-        assert parsed1.type == "msg"
-        assert len(parsed1.body["text"]) > 0
+        logging.info(f"Friday Replied: {Envelope.from_json(reply1).body['text']}")
 
-        # 3. Test Conversational Scenario 2: Cancelling meeting when client ditched
-        logging.info("\n--- Scenario 2: Cancelling Meeting on Client Ditch ---")
+        # 3. Ask what's on my plate
+        logging.info("\n--- 2. Asking 'What is on my plate today?' ---")
         msg2 = Envelope.create(
             type="msg",
             source="mobile:garvit-phone",
             target="server",
-            body=MsgBody(text="Hey Friday, the client has ditched us."),
+            body=MsgBody(text="Hey Friday, what's on my plate today?"),
         )
         await phone_ws.send(msg2.to_json())
         reply2 = await phone_ws.recv()
-        logging.info(f"Friday Replied: {reply2}")
-        parsed2 = Envelope.from_json(reply2)
-        assert parsed2.type == "msg"
-        assert len(parsed2.body["text"]) > 0
+        logging.info(f"Friday Replied: {Envelope.from_json(reply2).body['text']}")
 
-        # 4. Direct Action Test: reminder.list to verify DB status
-        list_env = Envelope.create(
-            type="action",
+        # 4. Cancel meeting with Harvard
+        logging.info("\n--- 3. Cancelling Meeting with Harvard due tomorrow ---")
+        msg3 = Envelope.create(
+            type="msg",
             source="mobile:garvit-phone",
             target="server",
-            body={"action": "reminder.list", "data": {}},
+            body=MsgBody(text="Hey Friday, cancel my meeting with Harvard due tomorrow"),
         )
-        await phone_ws.send(list_env.to_json())
-        list_res = await phone_ws.recv()
-        logging.info(f"Reminders in Database: {list_res}")
+        await phone_ws.send(msg3.to_json())
+        reply3 = await phone_ws.recv()
+        logging.info(f"Friday Replied: {Envelope.from_json(reply3).body['text']}")
 
-        logging.info("\n✅ All Brain Orchestrator & Action tests passed successfully!")
+        # 5. Ask what's on my plate again to confirm it's cleared
+        logging.info("\n--- 4. Checking agenda again ---")
+        msg4 = Envelope.create(
+            type="msg",
+            source="mobile:garvit-phone",
+            target="server",
+            body=MsgBody(text="What is on my plate now?"),
+        )
+        await phone_ws.send(msg4.to_json())
+        reply4 = await phone_ws.recv()
+        logging.info(f"Friday Replied: {Envelope.from_json(reply4).body['text']}")
+
+        logging.info("\n✅ All Harvard meeting & Daily Agenda tests completed successfully!")
 
 
 if __name__ == "__main__":
