@@ -85,8 +85,8 @@ async def evaluate_intent_with_jev(
             )
 
             intent = response.choices["intent"].choice
-            target_device = response.choices["target_device"].choice
-            is_destructive = response.nouls["is_destructive"].noul
+            raw_destructive = response.nouls["is_destructive"].noul
+            is_destructive = bool(float(raw_destructive) > 0.65) if raw_destructive is not None else False
             urgency_score = response.scores["urgency"].score
 
             urgency_labels = ["routine", "important", "emergency"]
