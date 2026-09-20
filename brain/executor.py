@@ -55,13 +55,15 @@ class DynamicOperationExecutor:
     async def _exec_overview(
         self, session: AsyncSession, decision: Any, user_text: str, **kwargs
     ) -> Tuple[str, Dict[str, Any]]:
-        overview = await dynamic_repo.get_agenda_overview(session)
+        timeframe = decision.parameters.get("timeframe", "today") if hasattr(decision, "parameters") else "today"
+        overview = await dynamic_repo.get_agenda_overview(session, timeframe=timeframe)
         reminders = [r.get("title", "") for r in overview["reminders"]]
         tasks = [t.get("title", "") for t in overview["tasks"]]
         events = [e.get("title", "") for e in overview["events"]]
 
+        label = "today" if timeframe == "today" else "tomorrow" if timeframe == "tomorrow" else "your schedule"
         if overview["total_items"] == 0:
-            summary = "Your schedule is completely clear for today. No pending reminders, tasks, or events."
+            summary = f"Your schedule is completely clear for {label}. No pending reminders, tasks, or events."
         else:
             parts = []
             if events:
@@ -70,7 +72,7 @@ class DynamicOperationExecutor:
                 parts.append(f"Reminders: {', '.join(reminders)}")
             if tasks:
                 parts.append(f"Pending tasks: {', '.join(tasks)}")
-            summary = f"Agenda overview: {'; '.join(parts)}."
+            summary = f"Schedule overview for {label}: {'; '.join(parts)}."
 
         return summary, overview
 

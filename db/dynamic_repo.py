@@ -259,24 +259,14 @@ class DynamicEntityRepository:
                 end_dt = start_dt + datetime.timedelta(days=1)
                 stmt = stmt.where(target_date_col >= start_dt, target_date_col < end_dt)
 
-        # 3. Apply Multi-Keyword Fuzzy Search
-        if query:
-            stop_words = {
-                "who", "what", "where", "when", "why", "how", "is", "are", "was",
-                "were", "the", "a", "an", "of", "in", "on", "at", "to", "for",
-                "with", "my", "your", "his", "her", "their", "our", "tell", "me",
-                "show", "find", "search", "about", "please", "can", "you", "does", "do", "whats", "whos"
-            }
-            raw_tokens = re.findall(r"[a-zA-Z0-9]+", query.lower())
-            keywords = [tok for tok in raw_tokens if tok not in stop_words and len(tok) > 1]
-            if not keywords:
-                keywords = [query.strip()]
-
+        # 3. Dynamic Text Search across all text/string columns
+        if query and query.strip():
+            terms = [t.strip() for t in query.split() if len(t.strip()) > 1]
             text_cols = [getattr(model_cls, c.name) for c in table.columns if isinstance(c.type, (String, Text))]
-            if text_cols:
+            if text_cols and terms:
                 conditions = []
-                for kw in keywords:
-                    pattern = f"%{kw}%"
+                for term in terms:
+                    pattern = f"%{term}%"
                     for col in text_cols:
                         conditions.append(col.ilike(pattern))
                 if conditions:
@@ -436,23 +426,23 @@ class DynamicEntityRepository:
         }
         return rowcount > 0
 
-    async def get_agenda_overview(self, session: AsyncSession) -> Dict[str, Any]:
-        """Universal schedule & daily briefing aggregator."""
+    async def get_agenda_overview(self, session: AsyncSession, timeframe: str = "today") -> Dict[str, Any]:
+        """Universal schedule & daily briefing aggregator supporting custom timeframe."""
         start_t = time.perf_counter()
-        reminders = await self.search(session, "reminders", filters={"status": "pending"}, limit=10)
-        tasks = await self.search(session, "tasks", filters={"status": "pending"}, limit=10)
-        events = await self.search(session, "events", limit=10)
+        reminders = await self.search(session, "reminders", filters={"status": "pending"}, timeframe=timeframe, limit=10)
+        tasks = await self.search(session, "tasks", filters={"status": "pending"}, timeframe=timeframe, limit=10)
+        events = await self.search(session, "events", timeframe=timeframe, limit=10)
         memories = await self.search(session, "memories", limit=5)
         elapsed_ms = round((time.perf_counter() - start_t) * 1000, 2)
 
         self.last_trace = {
             "entity": "all_agenda_entities",
             "operation": "overview",
-            "sql_executed": "SELECT * FROM reminders WHERE status='pending'; SELECT * FROM tasks WHERE status='pending'; SELECT * FROM events; SELECT * FROM memories;",
-            "sql_parameters": {"status": "pending"},
+            "sql_executed": f"SELECT * FROM reminders WHERE status='pending' [timeframe={timeframe}]; SELECT * FROM tasks [timeframe={timeframe}]; SELECT * FROM events [timeframe={timeframe}];",
+            "sql_parameters": {"status": "pending", "timeframe": timeframe},
             "latency_ms": elapsed_ms,
             "rows_affected": len(reminders) + len(tasks) + len(events),
-            "result_summary": f"Aggregated {len(reminders)} reminders, {len(tasks)} tasks, {len(events)} events",
+            "result_summary": f"Aggregated {len(reminders)} reminders, {len(tasks)} tasks, {len(events)} events for {timeframe}",
         }
 
         return {
@@ -461,6 +451,7 @@ class DynamicEntityRepository:
             "events": events,
             "recent_memories": memories,
             "total_items": len(reminders) + len(tasks) + len(events),
+            "timeframe": timeframe,
         }
 
 
