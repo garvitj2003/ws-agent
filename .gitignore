@@ -13,3 +13,7 @@ wheels/
 .env
 .env.*
 *.log
+
+# Local log streamers & monitors
+stream_logs.py
+scripts/laptop_monitor.py
