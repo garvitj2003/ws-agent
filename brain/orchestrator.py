@@ -1,19 +1,11 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Dict
 
-from actions.reminders import handle_create_reminder, handle_list_reminders, update_reminder_status
 from brain.groq_voice import generate_friday_reply
 from brain.jev_reflex import evaluate_intent_with_jev
-from db.repository import (
-    cancel_matching_reminder,
-    create_task,
-    get_daily_agenda,
-    list_reminders,
-    list_tasks,
-    update_task_status,
-)
+from db.dynamic_repo import dynamic_repo
 from db.session import get_db_session
 from models import Envelope, MsgBody
 
@@ -22,9 +14,9 @@ logger = logging.getLogger("brain_orchestrator")
 
 async def process_user_interaction(envelope: Envelope, server_instance=None) -> Envelope:
     """
-    Tandem execution pipeline:
-    1. Jev System 1: Determines intent, parameters, safety, and urgency in sub-50ms.
-    2. Execution: Calls strongly-typed Python DB repository functions in Postgres.
+    Universal metadata-driven execution pipeline:
+    1. Jev System 1: Determines operation ('create', 'search', 'update', 'delete', 'overview') and entity ('reminders', 'tasks', 'memories', etc.).
+    2. Dynamic Repository: Executes strongly-typed ORM operations on PostgreSQL.
     3. Groq Voice: Streams charismatic Friday conversational response.
     """
     user_text = envelope.body.get("text", "")
@@ -38,7 +30,7 @@ async def process_user_interaction(envelope: Envelope, server_instance=None) -> 
 
     logger.info(f"🧠 [Brain Orchestrator] Processing input from {envelope.source}: '{user_text}'")
 
-    # Step 1: Jev System 1 Reflex
+    # Step 1: Jev System 1 Dynamic Evaluation (<40ms)
     decision = await evaluate_intent_with_jev(user_text, source_device=envelope.source)
 
     # Step 2: Safety Gate Check
@@ -56,110 +48,117 @@ async def process_user_interaction(envelope: Envelope, server_instance=None) -> 
         )
 
     action_summary = "Processed request."
-    action_data: dict[str, Any] = {}
+    action_data: Dict[str, Any] = {}
 
-    # Step 3: Domain Action Execution (via DB Repository Functions)
+    # Step 3: Dynamic Universal Execution Layer
     try:
-        if decision.intent == "agenda_overview":
-            async with get_db_session() as session:
-                agenda = await get_daily_agenda(session)
-                action_data = agenda
+        async with get_db_session() as session:
+            # A. Agenda / Schedule Overview
+            if decision.operation == "overview":
+                overview = await dynamic_repo.get_agenda_overview(session)
+                action_data = overview
 
-                reminders_list = [r["title"] for r in agenda["pending_reminders"]]
-                tasks_list = [t["title"] for t in agenda["pending_tasks"]]
-                events_list = [e["title"] for e in agenda["events"]]
+                reminders = [r.get("title", "") for r in overview["reminders"]]
+                tasks = [t.get("title", "") for t in overview["tasks"]]
+                events = [e.get("title", "") for e in overview["events"]]
 
-                if agenda["total_items"] == 0:
+                if overview["total_items"] == 0:
                     action_summary = "Your schedule is completely clear for today. No pending reminders, tasks, or events."
                 else:
                     parts = []
-                    if events_list:
-                        parts.append(f"Events: {', '.join(events_list)}")
-                    if reminders_list:
-                        parts.append(f"Reminders: {', '.join(reminders_list)}")
-                    if tasks_list:
-                        parts.append(f"Pending tasks: {', '.join(tasks_list)}")
-                    action_summary = f"Agenda summary for today: {'; '.join(parts)}."
+                    if events:
+                        parts.append(f"Events: {', '.join(events)}")
+                    if reminders:
+                        parts.append(f"Reminders: {', '.join(reminders)}")
+                    if tasks:
+                        parts.append(f"Pending tasks: {', '.join(tasks)}")
+                    action_summary = f"Agenda overview: {'; '.join(parts)}."
 
-        elif decision.intent == "reminder_create":
-            title = decision.parameters.get("title", user_text)
-            scheduled_at = decision.parameters.get("scheduledAt")
-            rem_result = await handle_create_reminder(
-                envelope,
-                {"title": title, "scheduledAt": scheduled_at, "target": envelope.source},
-            )
-            action_summary = f"Created reminder '{title}' scheduled for {scheduled_at}."
-            action_data = rem_result
+            # B. Universal Create (reminders, tasks, memories, events, etc.)
+            elif decision.operation == "create" and decision.entity != "none":
+                data = decision.parameters.get("data") or {"title": user_text}
+                created_record = await dynamic_repo.create(session, decision.entity, data)
+                action_data = created_record
+                item_label = created_record.get("title") or created_record.get("content") or decision.entity
+                action_summary = f"Created new {decision.entity[:-1] if decision.entity.endswith('s') else decision.entity}: '{item_label}'."
 
-        elif decision.intent == "reminder_cancel":
-            search_text = decision.parameters.get("search_text", "")
-            timeframe = decision.parameters.get("timeframe", "any")
-
-            async with get_db_session() as session:
-                if search_text:
-                    # Targeted search & cancel (e.g. "Harvard", "client meeting")
-                    cancel_res = await cancel_matching_reminder(session, search_text=search_text, timeframe=timeframe)
-                    if cancel_res.get("found"):
-                        action_summary = f"Successfully cancelled meeting '{cancel_res['title']}'."
-                        action_data = cancel_res
-                    else:
-                        action_summary = f"Searched for pending meeting matching '{search_text}', but no matching record was found."
-                else:
-                    # Fallback: Cancel the latest pending reminder
-                    active_reminders = await list_reminders(session, status="pending", limit=1)
-                    if active_reminders:
-                        target_rem = active_reminders[0]
-                        await update_reminder_status(session, target_rem.id, status="cancelled")
-                        action_summary = f"Cancelled active meeting reminder '{target_rem.title}'."
-                    else:
-                        action_summary = "No active reminders found to cancel."
-
-        elif decision.intent == "task_create":
-            title = decision.parameters.get("title", user_text)
-            async with get_db_session() as session:
-                task = await create_task(session, title=title)
-                action_summary = f"Created task '{title}' with priority medium."
-                action_data = {"id": str(task.id), "title": task.title}
-
-        elif decision.intent == "task_complete":
-            async with get_db_session() as session:
-                tasks = await list_tasks(session, status="pending", limit=1)
-                if tasks:
-                    await update_task_status(session, tasks[0].id, status="completed")
-                    action_summary = f"Marked task '{tasks[0].title}' as completed."
-                else:
-                    action_summary = "Marked task as completed."
-
-        elif decision.intent == "device_action" and decision.target_device == "laptop":
-            if server_instance:
-                laptop_envelope = Envelope.create(
-                    type="action",
-                    source=envelope.source,
-                    target="laptop",
-                    body={"action": "exec", "command": user_text},
+            # C. Universal Search (recall memories, search tasks/reminders)
+            elif decision.operation == "search" and decision.entity != "none":
+                search_query = decision.parameters.get("search_query", user_text)
+                timeframe = decision.parameters.get("timeframe", "any")
+                results = await dynamic_repo.search(
+                    session=session,
+                    entity=decision.entity,
+                    query=search_query,
+                    timeframe=timeframe,
+                    limit=5,
                 )
-                recipients = server_instance.registry.resolve_targets("laptop")
-                if recipients:
-                    await server_instance.route_envelope(None, laptop_envelope)
-                    action_summary = "Dispatched execution command to your laptop."
+                action_data = {"count": len(results), "results": results}
+                if results:
+                    found_items = [r.get("content") or r.get("title") for r in results]
+                    action_summary = f"Found matching {decision.entity}: {', '.join(str(x) for x in found_items)}."
                 else:
-                    action_summary = "Laptop is currently offline, command queued."
+                    action_summary = f"No matching records found in {decision.entity} for query '{search_query}'."
 
-        else:
-            action_summary = "Conversational chat."
+            # D. Universal Update (e.g. cancel meeting, complete task)
+            elif decision.operation == "update" and decision.entity != "none":
+                search_query = decision.parameters.get("search_query", "")
+                timeframe = decision.parameters.get("timeframe", "any")
+                updates = decision.parameters.get("updates", {})
+
+                res = await dynamic_repo.search_and_update(
+                    session=session,
+                    entity=decision.entity,
+                    search_query=search_query,
+                    timeframe=timeframe,
+                    updates=updates,
+                )
+                action_data = res
+                if res.get("found"):
+                    updated_rec = res.get("record", {})
+                    item_label = updated_rec.get("title") or updated_rec.get("content") or "record"
+                    new_status = updates.get("status", "updated")
+                    action_summary = f"Updated {decision.entity[:-1] if decision.entity.endswith('s') else decision.entity} '{item_label}' to status '{new_status}'."
+                else:
+                    action_summary = f"Could not find any matching {decision.entity} to update for '{search_query}'."
+
+            # E. Device Action
+            elif decision.operation == "device_action":
+                if server_instance:
+                    target_device = decision.target_device if decision.target_device != "server" else "laptop"
+                    laptop_envelope = Envelope.create(
+                        type="action",
+                        source=envelope.source,
+                        target=target_device,
+                        body={"action": "exec", "command": user_text},
+                    )
+                    recipients = server_instance.registry.resolve_targets(target_device)
+                    if recipients:
+                        await server_instance.route_envelope(None, laptop_envelope)
+                        action_summary = f"Dispatched execution command to {target_device}."
+                    else:
+                        action_summary = f"{target_device.capitalize()} is currently offline."
+
+            else:
+                action_summary = "Conversational chat."
 
     except Exception as exc:
-        logger.error(f"Error executing action for intent {decision.intent}: {exc}", exc_info=True)
-        action_summary = f"Attempted action but encountered: {exc}"
+        logger.error(f"Error executing dynamic action: {exc}", exc_info=True)
+        action_summary = f"Attempted operation on {decision.entity} but encountered: {exc}"
 
-    # Step 4: Generate Friday's Voice/Response via Groq (openai/gpt-oss-20b)
+    # Step 4: Generate Friday's Voice Response via Groq (openai/gpt-oss-20b)
     friday_speech = await generate_friday_reply(
         user_input=user_text,
         action_summary=action_summary,
-        context={"intent": decision.intent, "urgency": decision.urgency, "action_data": action_data},
+        context={
+            "operation": decision.operation,
+            "entity": decision.entity,
+            "urgency": decision.urgency,
+            "action_data": action_data,
+        },
     )
 
-    # Step 5: Package and Return Envelope
+    # Step 5: Package and Deliver Response Envelope
     return Envelope.create(
         type="msg",
         source="server:friday-agent",

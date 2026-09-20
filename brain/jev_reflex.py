@@ -9,13 +9,15 @@ from typing import Any, Dict, Optional
 from typesafe_sdk import AsyncTypeSafeClient, Choice, Noul, Score
 
 from brain.config import TYPESAFE_API_KEY, has_typesafe_api_key
+from db.dynamic_repo import dynamic_repo
 
 logger = logging.getLogger("jev_reflex")
 
 
 @dataclass
 class JevDecision:
-    intent: str  # "agenda_overview", "reminder_create", "reminder_cancel", "task_create", "task_complete", "device_action", "general_chat", "query_sql"
+    operation: str  # "create", "search", "update", "delete", "overview", "device_action", "general_chat"
+    entity: str  # "reminders", "tasks", "events", "memories", "none"
     target_device: str  # "server", "mobile", "laptop", "broadcast"
     is_destructive: bool
     urgency: str  # "routine", "important", "emergency"
@@ -29,12 +31,14 @@ async def evaluate_intent_with_jev(
     context: Optional[Dict[str, Any]] = None,
 ) -> JevDecision:
     """
-    Evaluates input through Jev (System 1) to determine intent, device routing,
-    urgency, and safety gating in a single parallel pass.
+    Evaluates input through Jev System 1:
+    - Decides generic operation (create, search, update, delete, overview)
+    - Decides entity table (reminders, tasks, events, memories, none)
+    - Evaluates safety & urgency in <40ms.
     """
     if not has_typesafe_api_key():
-        logger.info("TYPESAFE_API_KEY not found in environment; using heuristic fallback reflex.")
-        return _heuristic_fallback_reflex(user_input, source_device)
+        logger.info("TYPESAFE_API_KEY not found in environment; using dynamic heuristic reflex.")
+        return _heuristic_dynamic_reflex(user_input, source_device)
 
     try:
         async with AsyncTypeSafeClient(api_key=TYPESAFE_API_KEY) as client:
@@ -42,41 +46,52 @@ async def evaluate_intent_with_jev(
                 "user_message": user_input,
                 "source_device": source_device,
                 "current_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "available_entities": dynamic_repo.get_available_entities(),
                 "context": context or {},
             }
 
             response = await client.system_one(
                 state=state,
                 questions={
-                    # 1. Intent Classification
-                    "intent": Choice(
-                        instructions="What is the user's primary intended action?",
+                    # 1. Operation Decision
+                    "operation": Choice(
+                        instructions="What fundamental operation is the user requesting?",
                         criteria={
-                            "agenda_overview": "User is asking for their daily briefing, what's on their plate, today's schedule, pending tasks or agenda",
-                            "reminder_create": "User wants to create, schedule, or set a reminder or meeting",
-                            "reminder_cancel": "User wants to cancel, ditch, clear, or remove an existing meeting or reminder",
-                            "task_create": "User wants to create or add a new task, todo, or work item",
-                            "task_complete": "User wants to mark a task as completed or done",
-                            "device_action": "User wants to execute a command or check status on laptop or server",
-                            "query_sql": "User is asking for custom database analytics",
-                            "general_chat": "General greeting, conversational question, or casual chat",
+                            "create": "User wants to create, save, remember, schedule, or add new data",
+                            "search": "User wants to look up, recall, find, ask about, or query existing data",
+                            "update": "User wants to modify, cancel, dismiss, reschedule, complete, or mark data",
+                            "delete": "User wants to permanently delete or remove a specific record",
+                            "overview": "User is asking for daily briefing, what's on their plate, or schedule summary",
+                            "device_action": "User wants to execute a terminal command on laptop or server",
+                            "general_chat": "Casual greeting, chit-chat, or general knowledge question",
                         },
                     ),
-                    # 2. Target Device Selection
-                    "target_device": Choice(
-                        instructions="Which device should execute or receive this action?",
+                    # 2. Entity Selection (Dynamically mapped to database tables)
+                    "entity": Choice(
+                        instructions="Which entity/table does this request relate to?",
                         criteria={
-                            "server": "Server handles database, agenda, agent reasoning, or schedule storage",
-                            "mobile": "Mobile phone (e.g. notify, ring, or mobile action)",
-                            "laptop": "User's laptop/MacBook (e.g. code, terminal, git, build)",
+                            "reminders": "Time-based notifications, alarms, meeting reminders, calls",
+                            "tasks": "Todo items, work tickets, action checklists",
+                            "events": "Calendar events, schedule appointments",
+                            "memories": "Personal facts, user preferences, notes, saved information",
+                            "none": "Not related to any specific stored database entity",
+                        },
+                    ),
+                    # 3. Target Device Selection
+                    "target_device": Choice(
+                        instructions="Which device should handle or receive this action?",
+                        criteria={
+                            "server": "Server handles database storage, agenda, or agent reasoning",
+                            "mobile": "Mobile phone",
+                            "laptop": "User's laptop/MacBook",
                             "broadcast": "All connected devices",
                         },
                     ),
-                    # 3. Safety Gate
+                    # 4. Safety Gate
                     "is_destructive": Noul(
-                        instructions="Does this action permanently delete files, drop tables, or perform dangerous operations?"
+                        instructions="Does this action permanently delete files, drop database tables, or destroy data?"
                     ),
-                    # 4. Urgency Scoring
+                    # 5. Urgency Scoring
                     "urgency": Score(
                         instructions="How urgent is this event/request?",
                         criteria=["routine", "important", "emergency"],
@@ -84,26 +99,29 @@ async def evaluate_intent_with_jev(
                 },
             )
 
-            intent = response.choices["intent"].choice
+            operation = response.choices["operation"].choice
+            entity = response.choices["entity"].choice
+            target_device = response.choices["target_device"].choice
+
             raw_destructive = response.nouls["is_destructive"].noul
             is_destructive = bool(float(raw_destructive) > 0.65) if raw_destructive is not None else False
-            urgency_score = response.scores["urgency"].score
 
+            urgency_score = response.scores["urgency"].score
             urgency_labels = ["routine", "important", "emergency"]
             try:
                 score_val = float(urgency_score) if urgency_score is not None else 0.0
-                idx = int(round(score_val))
-                idx = min(max(idx, 0), len(urgency_labels) - 1)
+                idx = min(max(int(round(score_val)), 0), len(urgency_labels) - 1)
                 urgency_str = urgency_labels[idx]
             except Exception:
                 urgency_str = "routine"
 
-            params = _extract_parameters(user_input, intent)
+            params = _extract_dynamic_parameters(user_input, operation, entity)
 
-            logger.info(f"⚡ [Jev System 1] Intent='{intent}', Target='{target_device}', Destructive={is_destructive}, Urgency='{urgency_str}'")
+            logger.info(f"⚡ [Jev Dynamic] Op='{operation}', Entity='{entity}', Target='{target_device}', Destructive={is_destructive}")
 
             return JevDecision(
-                intent=intent,
+                operation=operation,
+                entity=entity,
                 target_device=target_device,
                 is_destructive=is_destructive,
                 urgency=urgency_str,
@@ -112,85 +130,108 @@ async def evaluate_intent_with_jev(
             )
 
     except Exception as exc:
-        logger.error(f"Error evaluating with Jev API: {exc}. Falling back to heuristic reflex.", exc_info=True)
-        return _heuristic_fallback_reflex(user_input, source_device)
+        logger.error(f"Error evaluating with Jev API: {exc}. Falling back to dynamic heuristic reflex.", exc_info=True)
+        return _heuristic_dynamic_reflex(user_input, source_device)
 
 
-def _extract_parameters(text: str, intent: str) -> Dict[str, Any]:
-    """Helper to extract structured parameters like entity name, dates, title from natural text."""
-    params: Dict[str, Any] = {}
-    lower_text = text.lower()
+def _extract_dynamic_parameters(text: str, operation: str, entity: str) -> Dict[str, Any]:
+    """Dynamically parses parameters into structured dictionary."""
+    params: Dict[str, Any] = {"raw_text": text}
+    lower = text.lower()
+    now = datetime.datetime.now(datetime.timezone.utc)
 
-    if intent in ("reminder_create", "task_create"):
-        cleaned = re.sub(r"^(hey friday|friday|remind me to|remind me|create task to|add task)\s*", "", text, flags=re.IGNORECASE).strip()
-        params["title"] = cleaned if cleaned else text
+    # Timeframe extraction
+    if "tomorrow" in lower or "tmrw" in lower:
+        params["timeframe"] = "tomorrow"
+    elif "today" in lower:
+        params["timeframe"] = "today"
+    else:
+        params["timeframe"] = "any"
 
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if "tomorrow" in lower_text or "tmrw" in lower_text:
-            scheduled_time = now + datetime.timedelta(days=1)
-            if "1pm" in lower_text or "1 pm" in lower_text or "1:00" in lower_text:
-                scheduled_time = scheduled_time.replace(hour=13, minute=0, second=0, microsecond=0)
-            elif "12:50" in lower_text or "12.50" in lower_text:
-                scheduled_time = scheduled_time.replace(hour=12, minute=50, second=0, microsecond=0)
+    # Search Query / Entity extraction
+    # e.g. "cancel my meeting with Harvard", "what is my dog's name", "search task review PR"
+    match = re.search(r"(?:meeting with|remember that|remember|about|cancel|for|find|search|regarding)\s+(?:the\s+|my\s+)?([a-zA-Z0-9_\s'-]+)", text, flags=re.IGNORECASE)
+    if match:
+        params["search_query"] = match.group(1).strip()
+    else:
+        params["search_query"] = text.strip()
+
+    # Create / Data extraction
+    if operation == "create":
+        data: Dict[str, Any] = {}
+        cleaned = re.sub(r"^(hey friday|friday|remind me to|remind me|create task to|add task|remember that|remember)\s*", "", text, flags=re.IGNORECASE).strip()
+
+        if entity == "reminders":
+            data["title"] = cleaned if cleaned else text
+            # Calculate time
+            if params["timeframe"] == "tomorrow":
+                scheduled_time = (now + datetime.timedelta(days=1)).replace(hour=13, minute=0, second=0, microsecond=0)
+            else:
+                scheduled_time = now + datetime.timedelta(hours=1)
+            data["scheduled_at"] = scheduled_time.isoformat()
+            data["status"] = "pending"
+
+        elif entity == "tasks":
+            data["title"] = cleaned if cleaned else text
+            data["priority"] = "high" if any(k in lower for k in ("high", "urgent", "asap")) else "medium"
+            data["status"] = "pending"
+
+        elif entity == "memories":
+            data["content"] = cleaned if cleaned else text
+            data["category"] = "preference" if any(k in lower for k in ("like", "prefer", "favorite", "love")) else "general"
+
+        params["data"] = data
+
+    elif operation == "update":
+        if any(k in lower for k in ("cancel", "cancelled", "ditch", "clear", "dismiss")):
+            params["updates"] = {"status": "cancelled"}
+        elif any(k in lower for k in ("done", "finish", "finished", "complete", "completed")):
+            params["updates"] = {"status": "completed"}
         else:
-            scheduled_time = now + datetime.timedelta(hours=1)
-
-        params["scheduledAt"] = scheduled_time.isoformat()
-
-    elif intent == "reminder_cancel":
-        # Extract entity/client name (e.g. "Harvard", "client", "dentist")
-        match = re.search(r"(?:meeting with|cancel my|cancel|clear|ditch)\s+(?:the\s+)?([a-zA-Z0-9_-]+)", text, flags=re.IGNORECASE)
-        if match:
-            extracted = match.group(1).strip()
-            if extracted.lower() not in ("my", "the", "a", "our", "meeting", "reminder"):
-                params["search_text"] = extracted
-
-        # Extract timeframe
-        if "tomorrow" in lower_text or "tmrw" in lower_text:
-            params["timeframe"] = "tomorrow"
-        elif "today" in lower_text:
-            params["timeframe"] = "today"
-        else:
-            params["timeframe"] = "any"
-
-        params["raw_text"] = text
-
-    elif intent == "agenda_overview":
-        if "tomorrow" in lower_text or "tmrw" in lower_text:
-            params["timeframe"] = "tomorrow"
-        else:
-            params["timeframe"] = "today"
+            params["updates"] = {}
 
     return params
 
 
-def _heuristic_fallback_reflex(text: str, source_device: str) -> JevDecision:
-    """Fallback rule-based reflex when API key is not yet set."""
+def _heuristic_dynamic_reflex(text: str, source_device: str) -> JevDecision:
+    """Fallback rule-based reflex when API key is not configured."""
     lower = text.lower()
 
-    if any(k in lower for k in ("on my plate", "daily briefing", "my schedule", "what do i have", "agenda", "whats on my")):
-        intent = "agenda_overview"
-    elif any(k in lower for k in ("ditched", "cancel meeting", "clear meeting", "cancel reminder", "remove meeting", "cancel my")):
-        intent = "reminder_cancel"
-    elif any(k in lower for k in ("meeting", "remind", "reminder", "schedule", "appointment")):
-        intent = "reminder_create"
+    # 1. Operation & Entity Detection
+    if any(k in lower for k in ("on my plate", "daily briefing", "my schedule", "agenda", "whats on my", "what do i have")):
+        operation = "overview"
+        entity = "reminders"
+    elif any(k in lower for k in ("remember that", "remember", "my dog", "my birthday", "favorite", "my car")):
+        if any(k in lower for k in ("what", "where", "who", "when", "tell me")):
+            operation = "search"
+        else:
+            operation = "create"
+        entity = "memories"
+    elif any(k in lower for k in ("cancel", "clear meeting", "cancelled", "ditch")):
+        operation = "update"
+        entity = "reminders"
+    elif any(k in lower for k in ("meeting", "remind", "reminder", "alarm")):
+        operation = "create"
+        entity = "reminders"
     elif any(k in lower for k in ("todo", "task", "buy", "fix", "implement")):
-        intent = "task_create"
+        operation = "create"
+        entity = "tasks"
     elif any(k in lower for k in ("run build", "git", "terminal", "docker")):
-        intent = "device_action"
-    elif any(k in lower for k in ("select", "show me all reminders", "list tasks", "query")):
-        intent = "query_sql"
+        operation = "device_action"
+        entity = "none"
     else:
-        intent = "general_chat"
+        operation = "general_chat"
+        entity = "none"
 
-    target_device = "laptop" if intent == "device_action" else "server"
+    target_device = "laptop" if operation == "device_action" else "server"
     is_destructive = bool(re.search(r"\b(drop table|rm -rf|delete from|killall)\b", lower))
-    urgency = "emergency" if any(k in lower for k in ("urgent", "emergency", "crash", "down", "critical")) else "routine"
+    urgency = "emergency" if any(k in lower for k in ("urgent", "emergency", "crash", "critical")) else "routine"
 
     return JevDecision(
-        intent=intent,
+        operation=operation,
+        entity=entity,
         target_device=target_device,
         is_destructive=is_destructive,
         urgency=urgency,
-        parameters=_extract_parameters(text, intent),
+        parameters=_extract_dynamic_parameters(text, operation, entity),
     )
