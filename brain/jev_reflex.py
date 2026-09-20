@@ -90,7 +90,13 @@ async def evaluate_intent_with_jev(
             urgency_score = response.scores["urgency"].score
 
             urgency_labels = ["routine", "important", "emergency"]
-            urgency_str = urgency_labels[min(max(urgency_score, 0), len(urgency_labels) - 1)]
+            try:
+                score_val = float(urgency_score) if urgency_score is not None else 0.0
+                idx = int(round(score_val))
+                idx = min(max(idx, 0), len(urgency_labels) - 1)
+                urgency_str = urgency_labels[idx]
+            except Exception:
+                urgency_str = "routine"
 
             params = _extract_parameters(user_input, intent)
 
