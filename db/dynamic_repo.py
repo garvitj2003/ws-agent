@@ -261,7 +261,11 @@ class DynamicEntityRepository:
 
         # 3. Dynamic Text Search across all text/string columns
         if query and query.strip():
-            terms = [t.strip() for t in query.split() if len(t.strip()) > 1]
+            raw_terms = [t.strip() for t in query.split() if len(t.strip()) > 1]
+            stopwords = {"the", "a", "an", "is", "of", "in", "to", "for", "on", "at", "by", "with", "from", "my", "your", "our", "me", "we", "do", "have", "who", "what", "where", "when", "how", "and", "or"}
+            filtered_terms = [t for t in raw_terms if t.lower() not in stopwords]
+            terms = filtered_terms if filtered_terms else raw_terms
+
             text_cols = [getattr(model_cls, c.name) for c in table.columns if isinstance(c.type, (String, Text))]
             if text_cols and terms:
                 conditions = []

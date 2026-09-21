@@ -64,8 +64,8 @@ async def generate_friday_reply_detailed(
         response = await groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
-            temperature=0.7,
-            max_tokens=350,
+            temperature=0.5,
+            max_tokens=120,
         )
 
         message = response.choices[0].message
